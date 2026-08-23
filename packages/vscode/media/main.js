@@ -61,6 +61,13 @@
     trusted: null,
     workspace: "",
     configPath: "",
+    instanceId: "",
+    instanceLabel: "",
+    instanceFingerprint: "",
+    connectionFingerprint: "",
+    connectionName: "",
+    connectionDescription: "",
+    connectionKey: "",
     process: { status: "loading", mode: "", pid: null, startedAt: null, awaitingInput: false },
     health: null,
     hostingMode: "",
@@ -204,6 +211,13 @@
       trusted: typeof source.trusted === "boolean" ? source.trusted : null,
       workspace: cleanText(source.workspace, 8192),
       configPath: cleanText(source.configPath, 8192),
+      instanceId: cleanText(source.instanceId, 64),
+      instanceLabel: cleanText(source.instanceLabel, 64),
+      instanceFingerprint: cleanText(source.instanceFingerprint, 32),
+      connectionFingerprint: cleanText(source.connectionFingerprint, 32),
+      connectionName: cleanText(source.connectionName, 200),
+      connectionDescription: cleanText(source.connectionDescription, 500),
+      connectionKey: cleanText(source.connectionKey, 100),
       process: {
         status: asText(processState.status, "stopped").toLowerCase(),
         mode: cleanText(processState.mode, 200).toLowerCase(),
@@ -558,12 +572,12 @@
     refs.localModeButton.type = "button";
     refs.localModeButton.dataset.uiMode = "local";
     append(modeSwitch, refs.remoteModeButton, refs.localModeButton);
-    refs.openChatGptButton = makeButton("Open ChatGPT Work", "openChatGpt", {
+    refs.openChatGptButton = makeButton("Open ChatGPT Chat", "openChatGpt", {
       variant: "primary",
       compact: true,
       icon: "↗",
       className: "header-action",
-      title: "Open ChatGPT Work, the current surface that supports plugins and remote MCP tools",
+      title: "Open normal ChatGPT Chat with this machine's VSPiLink connection",
     });
     refs.headerStatus = el("span", "header-status", "Loading");
     refs.headerStatus.setAttribute("aria-live", "polite");
@@ -934,7 +948,7 @@
         description: "The OAuth client already exists; finish Connect/Authorize in ChatGPT",
       };
       if (currentState.wizard.credential) return { label: "Authorize", tone: "progress", description: "Finish Connect/Authorize in the ChatGPT tab" };
-      if (currentState.wizard.chatGptPageOpened) return { label: "Install plugin", tone: "progress", description: "In ChatGPT Work, open Plugins and install or connect the private VSPiLink plugin" };
+      if (currentState.wizard.chatGptPageOpened) return { label: "Create connection", tone: "progress", description: "In ChatGPT Plugins, create this machine's personal VSPiLink connection" };
       return { label: "Not connected", tone: "warning", description: "Connect ChatGPT to the VSPiLink MCP server" };
     }
     if (currentState.chat.status === "needs-workspace") return { label: "Folder", tone: "warning", description: "Choose the folder where Pi should work" };
@@ -998,11 +1012,12 @@
       const registered = el("div", "remote-connected remote-connected--pending");
       const registeredCopy = el("div", "remote-connected__copy");
       append(registeredCopy,
-        el("strong", "remote-connected__title", "The OAuth client is already registered"),
-        el("span", "remote-connected__description", "Do not search for a callback or create another client. Continue below, then open VSPiLink in ChatGPT and choose Connect/Authorize.")
+        el("strong", "remote-connected__title", "Authorize " + (currentState.connectionName || "this VSPiLink server")),
+        el("span", "remote-connected__description", "Setup opens once in your system browser because VS Code blocks OAuth popups. After approval, ChatGPT returns here automatically."),
+        el("code", "connection-endpoint__url", (currentState.connectionFingerprint || "") + " · " + (currentState.mcpUrl || ""))
       );
       const registeredActions = el("div", "remote-connected__actions");
-      registeredActions.appendChild(makeButton("Continue in ChatGPT", "connectChatGpt", { variant: "primary", compact: true, icon: "↗" }));
+      registeredActions.appendChild(makeButton("Authorize once in browser", "connectChatGpt", { variant: "primary", compact: true, icon: "↗" }));
       append(registered, registeredCopy, registeredActions);
       shell.appendChild(registered);
       return shell;
@@ -1014,11 +1029,11 @@
       el("strong", "remote-connected__title", currentState.externalMcp.active ? "ChatGPT is connected" : "VSPiLink is configured"),
       el("span", "remote-connected__description", currentState.externalMcp.active
         ? "Active MCP connections: " + currentState.externalMcp.activeSessions + ". Write in the main ChatGPT tab; this panel monitors coordination activity, agents, and tasks."
-        : "OAuth is stored persistently, so the callback does not need to be entered again. Open ChatGPT Work and start a task; the MCP session will activate automatically.")
+        : "OAuth is stored persistently, so the callback does not need to be entered again. Open normal ChatGPT Chat, select this machine's VSPiLink connection, and start a task.")
     );
     const actions = el("div", "remote-connected__actions");
     append(actions,
-      makeButton("Open ChatGPT Work", "openChatGpt", { variant: "primary", compact: true, icon: "↗" }),
+      makeButton("Open ChatGPT Chat", "openChatGpt", { variant: "primary", compact: true, icon: "↗" }),
       makeButton("Open collaboration monitor", "openCollaborationMonitor", { variant: "secondary", compact: true, icon: ">_" })
     );
     append(connected, copy, actions);
@@ -1039,8 +1054,8 @@
     if (!currentState.collaboration.messages.length && !currentState.collaboration.activity.length) {
       transcript.appendChild(renderRemoteEmpty(
         "No coordination activity yet",
-        "Start a task in ChatGPT Work. MCP calls and messages published by agents will appear here automatically; observed agents and shared tasks remain in the monitor panels.",
-        { label: "Open ChatGPT Work", command: "openChatGpt" }
+        "Start a task in normal ChatGPT Chat with this machine's VSPiLink connection selected. MCP calls and messages published by agents will appear here automatically.",
+        { label: "Open ChatGPT Chat", command: "openChatGpt" }
       ));
     }
     if (currentState.collaboration.error) transcript.appendChild(renderInlineError(currentState.collaboration.error));
@@ -1101,11 +1116,39 @@
     const guide = el("div", "connection-guide");
     const intro = el("div", "connection-guide__intro");
     append(intro,
-      el("p", "connection-guide__eyebrow", "PRIMARY PATH · CHATGPT WORK + MCP"),
-      el("h3", "connection-guide__title", "Connect ChatGPT Work to this workspace"),
-      el("p", "connection-guide__description", "ChatGPT Work remains the agent surface and coordinator. Its selected model uses the Pi tools that VSPiLink exposes for this folder through an OAuth-protected MCP connection.")
+      el("p", "connection-guide__eyebrow", "ONE MACHINE · ONE CHATGPT CONNECTION"),
+      el("h3", "connection-guide__title", "Connect normal ChatGPT Chat to this machine"),
+      el("p", "connection-guide__description", "Create one personal VSPiLink connection for this exact server. In every Chat where you want to program this machine, select that exact connection from the Plugins menu.")
     );
     guide.appendChild(intro);
+
+    const connectionIdentity = el("div", "connection-endpoint");
+    const connectionIdentityCopy = el("div", "connection-endpoint__copy");
+    append(
+      connectionIdentityCopy,
+      el("span", "connection-endpoint__label", "Create a separate app/connection with this exact name"),
+      el("code", "connection-endpoint__value", currentState.connectionName || "Not available")
+    );
+    const connectionIdentityActions = el("div", "connection-endpoint__actions");
+    connectionIdentityActions.appendChild(makeWizardButton("Copy name", "copyCredential", {
+      field: "connectionName", variant: "secondary", compact: true, icon: "⧉", disabled: !currentState.connectionName,
+    }));
+    append(connectionIdentity, connectionIdentityCopy, connectionIdentityActions);
+    guide.appendChild(connectionIdentity);
+
+    const connectionDescription = el("div", "connection-endpoint");
+    const connectionDescriptionCopy = el("div", "connection-endpoint__copy");
+    append(
+      connectionDescriptionCopy,
+      el("span", "connection-endpoint__label", "Description"),
+      el("code", "connection-endpoint__value", currentState.connectionDescription || "Not available")
+    );
+    const connectionDescriptionActions = el("div", "connection-endpoint__actions");
+    connectionDescriptionActions.appendChild(makeWizardButton("Copy description", "copyCredential", {
+      field: "connectionDescription", variant: "secondary", compact: true, icon: "⧉", disabled: !currentState.connectionDescription,
+    }));
+    append(connectionDescription, connectionDescriptionCopy, connectionDescriptionActions);
+    guide.appendChild(connectionDescription);
 
     const endpoint = el("div", "connection-endpoint");
     const endpointCopy = el("div", "connection-endpoint__copy");
@@ -1120,35 +1163,32 @@
 
     const catalogWarning = el("div", "connection-catalog-warning");
     append(catalogWarning,
-      el("strong", "connection-catalog-warning__title", "Do not choose a similarly named public result."),
-      el("span", "connection-catalog-warning__text", "Your VSPiLink entry must come from your personal or workspace plugin source and point to the MCP endpoint shown above. Searching for “mcp server” will show other vendors' servers.")
+      el("strong", "connection-catalog-warning__title", "One server means one separate VSPiLink connection."),
+      el("span", "connection-catalog-warning__text", "Create a new entry with the exact name and endpoint above. Never edit or reuse an entry that points to another VPS or local machine. Searching for “mcp server” will show other vendors' servers.")
     );
     guide.appendChild(catalogWarning);
 
     const steps = el("ol", "connection-steps");
-    const workOpened = currentState.wizard.chatGptPageOpened === true;
-    const workActions = el("div", "connection-step__actions");
-    workActions.appendChild(makeWizardButton(
-      workOpened ? "Reopen ChatGPT Work" : "Open ChatGPT Work",
+    const pluginsOpened = currentState.wizard.chatGptPageOpened === true;
+    const pluginActions = el("div", "connection-step__actions");
+    pluginActions.appendChild(makeWizardButton(
+      pluginsOpened ? "Reopen setup in browser" : "Open setup in browser",
       "openChatGpt",
-      { destination: "work", variant: workOpened ? "secondary" : "primary", compact: true, icon: "↗" }
+      { destination: "plugins", variant: pluginsOpened ? "secondary" : "primary", compact: true, icon: "↗" }
     ));
     steps.appendChild(renderConnectionStep(
       1,
-      "Open ChatGPT Work",
-      "In the ChatGPT tab, use the surface selector at the upper left and choose Work. VSPiLink tools are not available in normal Chat under the current plugin model.",
-      workOpened,
-      workActions
+      "Open ChatGPT Plugins once in your system browser",
+      "VS Code blocks the OAuth popup used by ChatGPT, so setup uses your normal browser. Click + to create this machine's plugin; after authorization, everyday ChatGPT opens back inside VS Code.",
+      pluginsOpened,
+      pluginActions
     ));
-    const pluginAction = workOpened && !currentState.wizard.credential
-      ? makeWizardButton("Open Work Plugins", "openChatGpt", { destination: "plugins", variant: "primary", compact: true })
-      : null;
     steps.appendChild(renderConnectionStep(
       2,
-      "Install or connect the private VSPiLink plugin",
-      "In Work, click Plugins in the left sidebar. Open the VSPiLink entry supplied by your personal or workspace plugin source, then click Install or Connect. If you own the plugin and the builder is available, set its MCP URL to the endpoint copied above and choose OAuth. If no VSPiLink entry or creation/import control exists, ask the workspace administrator or publisher; do not install another vendor's result.",
+      "Create this server-specific VSPiLink connection",
+      "Enter the exact Name, Description, and MCP endpoint shown above. Choose OAuth and Dynamic Client Registration (DCR), then click Create and review the discovered tools. Never repoint or reuse another machine's VSPiLink entry.",
       currentState.externalMcp.configured,
-      pluginAction
+      null
     ));
     steps.appendChild(renderCallbackStep());
     steps.appendChild(renderCredentialStep());
@@ -1156,12 +1196,12 @@
 
     const legacy = el("details", "manual-oauth");
     legacy.dataset.renderStateKey = "legacy-chatgpt-connection";
-    legacy.appendChild(el("summary", "manual-oauth__summary", "Legacy Developer Mode compatibility"));
-    legacy.appendChild(el("p", "manual-oauth__description", "Use this only if your account still exposes the older Developer Mode/private-connection builder. Open Security and login, enable Developer Mode, then open Plugins and create VSPiLink with the endpoint above. This compatibility path is not the supported primary Work flow."));
+    legacy.appendChild(el("summary", "manual-oauth__summary", "If the + button is missing"));
+    legacy.appendChild(el("p", "manual-oauth__description", "Open Security and login, enable Developer Mode for personal plugins, then return to Plugins. Account-level creation and OAuth approval remain deliberate ChatGPT actions."));
     const legacyActions = el("div", "connection-step__actions");
     append(legacyActions,
       makeWizardButton("Open Security and login", "openChatGpt", { destination: "security", variant: "secondary", compact: true, icon: "↗" }),
-      makeWizardButton("Open legacy Plugins", "openChatGpt", { destination: "plugins", variant: "secondary", compact: true, icon: "↗" })
+      makeWizardButton("Open Plugins", "openChatGpt", { destination: "plugins", variant: "secondary", compact: true, icon: "↗" })
     );
     legacy.appendChild(legacyActions);
     guide.appendChild(legacy);
@@ -1194,7 +1234,7 @@
         ? "The ChatGPT OAuth client is already registered. You do not need to copy or enter a callback again."
         : available
           ? "In the ChatGPT form, open Advanced OAuth settings → Registration method → Dynamic Client Registration (DCR), then click Create. VSPiLink registers the callback automatically; you do not need to find or copy it."
-          : "Open ChatGPT Work first. When the VSPiLink plugin builder asks for OAuth registration, use DCR; there is no callback to find or copy.",
+          : "Open ChatGPT Plugins first. When the builder asks for OAuth registration, use DCR; there is no callback to find or copy.",
       complete,
       null
     );
@@ -1238,7 +1278,7 @@
       "Complete OAuth and authorize",
       credential
         ? "Return to ChatGPT and paste the values below. Then click Connect/Authorize and approve the request on the VSPiLink page."
-        : "After the callback is registered, VSPiLink generates a client ID and secret without exposing the secret in logs.",
+        : "Click Create, then Connect/Authorize and approve the request on the VSPiLink page. DCR creates the OAuth client automatically.",
       currentState.externalMcp.connected,
       null
     );
@@ -1341,7 +1381,7 @@
       });
       body.appendChild(clients);
     }
-    body.appendChild(el("p", "compact-agents__hint", "Write in the main ChatGPT Work tab. This panel only observes published identities, MCP clients, and shared tasks; it is not a remote prompt box."));
+    body.appendChild(el("p", "compact-agents__hint", "Write in the main ChatGPT Chat tab with this machine's VSPiLink connection selected. This panel only observes identities, MCP clients, and shared tasks; it is not a remote prompt box."));
     details.appendChild(body);
     return details;
   }

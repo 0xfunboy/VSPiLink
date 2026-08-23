@@ -9,7 +9,7 @@ import { pipeline } from "node:stream/promises";
 import { Readable, Transform } from "node:stream";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { loadEnvironment, loadRuntimeConfig, defaultConfigPath, defaultCoordinationDataDir, type RuntimeConfig } from "./config.js";
+import { createInstanceId, defaultInstanceLabel, loadEnvironment, loadRuntimeConfig, defaultConfigPath, defaultCoordinationDataDir, type RuntimeConfig } from "./config.js";
 import { chatCliAutoLaunchEnabled, launchChatCli } from "./chat-cli.js";
 import {
   effectiveClientTokenVersion,
@@ -191,6 +191,8 @@ function initialize(portOverride?: number): void {
     `PI_WORK_DIR=${workspace}`,
     `PI_DATA_DIR=${path.dirname(configPath)}`,
     `PI_COORDINATION_DATA_DIR=${defaultCoordinationDataDir(configPath)}`,
+    `PI_INSTANCE_ID=${createInstanceId()}`,
+    `PI_INSTANCE_LABEL=${defaultInstanceLabel(workspace)}`,
     `PORT=${portOverride ?? 3200}`,
     `JWT_SECRET=${secret()}`,
     `PI_BOOTSTRAP_SECRET=${secret()}`,
@@ -691,7 +693,7 @@ async function runFirstTimeSetup(serverUrl: string, forceSetup: boolean): Promis
       console.error("An OAuth client is already configured. Use 'pilink start --setup' to register another client.");
       return;
     }
-    printChatGptSetupInstructions(serverUrl);
+    printChatGptSetupInstructions(serverUrl, runtimeConfig.connectionName);
     const readline = createInterface({ input: process.stdin, output: process.stderr });
     let callbackUrl: string;
     try {
@@ -712,7 +714,7 @@ async function runFirstTimeSetup(serverUrl: string, forceSetup: boolean): Promis
       ? await requestOwnerPairing(runtimeConfig.port, runtimeConfig.bootstrapSecret, serverUrl)
       : undefined;
     const { client, client_secret: clientSecret } = await registerClient(
-      "ChatGPT",
+      runtimeConfig.connectionName,
       [callbackUrl],
       ["authorization_code", "refresh_token"],
       "mcp:tools offline_access",
@@ -830,13 +832,15 @@ function shouldOpenBrowser(): boolean {
   return process.stdin.isTTY === true && process.env.CI !== "true";
 }
 
-function printChatGptSetupInstructions(serverUrl: string): void {
+function printChatGptSetupInstructions(serverUrl: string, connectionName: string): void {
   console.error("\n=== First-time ChatGPT setup ===");
   console.error("1. In ChatGPT, open Settings → Apps/Connectors (or your MCP connections page) → Add connection.");
-  console.error(`2. Set the connection/MCP server URL to: ${serverUrl}/sse`);
-  console.error("3. Select Authentication: OAuth.");
-  console.error("4. Open Advanced OAuth settings and select Registration method: User defined.");
-  console.error("5. Copy ChatGPT's callback URL and paste it below. PiLink will create and print the client ID and secret.");
+  console.error(`2. Create a NEW connection named exactly: ${connectionName}`);
+  console.error(`3. Set its MCP server URL to: ${serverUrl}/sse`);
+  console.error("   Never reuse or edit a VSPiLink connection that points to another server.");
+  console.error("4. Select Authentication: OAuth.");
+  console.error("5. Open Advanced OAuth settings and select Registration method: User defined.");
+  console.error("6. Copy ChatGPT's callback URL and paste it below. PiLink will create and print the client ID and secret.");
 }
 
 function assertHttpUrl(value: string, label: string): void {

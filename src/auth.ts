@@ -386,6 +386,7 @@ export function createAuthorizationCode(
   clientId: string,
   clientVersion: number,
   redirectUri: string,
+  resource: string | undefined,
   scope: string,
   codeChallenge: string,
   codeChallengeMethod: string
@@ -402,6 +403,7 @@ export function createAuthorizationCode(
     client_id: clientId,
     client_version: clientVersion,
     redirect_uri: redirectUri,
+    ...(resource ? { resource } : {}),
     scope,
     code_challenge: codeChallenge || "",
     code_challenge_method: (codeChallengeMethod || "S256") as "S256",

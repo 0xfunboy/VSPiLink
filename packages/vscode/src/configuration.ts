@@ -17,6 +17,13 @@ export interface ConfigSnapshot {
   unsafeFullAccess: boolean;
   fullAccessClientIds: string[];
   serverUrl: string;
+  instanceId: string;
+  instanceLabel: string;
+  instanceSlug: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionKey: string;
   bootstrapSecret?: string;
   clients: PublicClientSummary[];
 }
@@ -134,6 +141,8 @@ export function provisionWizardConfiguration(options: {
       `PI_WORK_DIR=${serializeEnvValue(workspace)}`,
       `PI_DATA_DIR=${serializeEnvValue(path.dirname(options.configPath))}`,
       `PI_COORDINATION_DATA_DIR=${serializeEnvValue(defaultCoordinationDataDir(options.configPath))}`,
+      `PI_INSTANCE_ID=${crypto.randomUUID()}`,
+      `PI_INSTANCE_LABEL=${defaultInstanceLabel(workspace)}`,
       `PORT=${port}`,
       `JWT_SECRET=${privateSecret()}`,
       `PI_BOOTSTRAP_SECRET=${privateSecret()}`,
@@ -159,7 +168,10 @@ export function provisionWizardConfiguration(options: {
     ].join("\n");
   }
   contents = updateEnvValue(contents, "PI_WORK_DIR", workspace);
-  if (!parseEnv(contents).PI_COORDINATION_DATA_DIR) {
+  const existingValues = parseEnv(contents);
+  if (!existingValues.PI_INSTANCE_ID) contents = updateEnvValue(contents, "PI_INSTANCE_ID", crypto.randomUUID());
+  if (!existingValues.PI_INSTANCE_LABEL) contents = updateEnvValue(contents, "PI_INSTANCE_LABEL", defaultInstanceLabel(workspace));
+  if (!existingValues.PI_COORDINATION_DATA_DIR) {
     contents = updateEnvValue(contents, "PI_COORDINATION_DATA_DIR", defaultCoordinationDataDir(options.configPath));
   }
   contents = updateEnvValue(contents, "PI_UNSAFE_FULL_ACCESS", "false");
@@ -226,6 +238,7 @@ export function readConfigSnapshot(configPath: string, fallbackWorkspace: string
   const host = values.HOST || "127.0.0.1";
   const localHost = host === "0.0.0.0" ? "127.0.0.1" : host;
   const serverUrl = (values.SERVER_URL || `http://${localHost}:${port}`).replace(/\/$/, "");
+  const identity = resolveConfigInstanceIdentity(values, workspace, serverUrl, configPath);
   return {
     configPath,
     configured,
@@ -238,15 +251,99 @@ export function readConfigSnapshot(configPath: string, fallbackWorkspace: string
     unsafeFullAccess: values.PI_UNSAFE_FULL_ACCESS === "true",
     fullAccessClientIds: parseFullAccessClientIds(values.PI_FULL_ACCESS_CLIENT_IDS),
     serverUrl,
+    ...identity,
     bootstrapSecret: values.PI_BOOTSTRAP_SECRET,
     clients: readClients(dataDir),
   };
+}
+
+interface ConfigInstanceIdentity {
+  instanceId: string;
+  instanceLabel: string;
+  instanceSlug: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionKey: string;
+}
+
+export function defaultInstanceLabel(workspace: string, hostname = os.hostname()): string {
+  const project = path.basename(path.resolve(workspace));
+  const combined = `${hostname}-${project}`
+    .normalize("NFKD")
+    .replace(/[^a-z0-9._ -]+/giu, "-")
+    .replace(/[\s._-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 48);
+  return combined || "server";
+}
+
+function resolveConfigInstanceIdentity(
+  values: Readonly<Record<string, string>>,
+  workspace: string,
+  serverUrl: string,
+  configPath: string,
+): ConfigInstanceIdentity {
+  const instanceId = values.PI_INSTANCE_ID
+    ? normalizeInstanceId(values.PI_INSTANCE_ID)
+    : deterministicInstanceId(values.JWT_SECRET
+      ? `legacy\0${values.JWT_SECRET}`
+      : `unconfigured\0${os.hostname()}\0${path.resolve(configPath)}\0${workspace}`);
+  const instanceLabel = values.PI_INSTANCE_LABEL
+    ? normalizeInstanceLabel(values.PI_INSTANCE_LABEL)
+    : defaultInstanceLabel(workspace);
+  const instanceSlug = slug(instanceLabel, 24);
+  const instanceFingerprint = fingerprint(`instance\0${instanceId}`);
+  const connectionFingerprint = fingerprint(`connection\0${instanceId}\0${new URL(serverUrl).origin}`);
+  return {
+    instanceId,
+    instanceLabel,
+    instanceSlug,
+    instanceFingerprint,
+    connectionFingerprint,
+    connectionName: `VSPiLink — ${instanceLabel} · ${connectionFingerprint}`,
+    connectionKey: `vspilink-${instanceSlug}-${connectionFingerprint}`,
+  };
+}
+
+function normalizeInstanceId(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(normalized)) {
+    throw new Error("PI_INSTANCE_ID must be a canonical UUID");
+  }
+  return normalized;
+}
+
+function normalizeInstanceLabel(value: string): string {
+  const normalized = value.trim();
+  if (!/^[a-z0-9][a-z0-9._ -]{0,63}$/iu.test(normalized)) {
+    throw new Error("PI_INSTANCE_LABEL must be 1-64 safe display characters");
+  }
+  return normalized;
+}
+
+function deterministicInstanceId(seed: string): string {
+  const bytes = Buffer.from(crypto.createHash("sha256").update(seed, "utf8").digest("hex").slice(0, 32), "hex");
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function fingerprint(value: string): string {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex").slice(0, 10);
+}
+
+function slug(value: string, maxLength: number): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, maxLength) || "server";
 }
 
 const RUNTIME_ENVIRONMENT_KEYS = [
   "PI_WORK_DIR",
   "PI_DATA_DIR",
   "PI_COORDINATION_DATA_DIR",
+  "PI_INSTANCE_ID",
+  "PI_INSTANCE_LABEL",
   "PORT",
   "HOST",
   "SERVER_URL",

@@ -9,6 +9,16 @@ import { AgentChatBroker, AgentChatStore } from "../dist/chat.js";
 import { createMcpServer } from "../dist/mcp.js";
 import { AgentTaskStore } from "../dist/tasks.js";
 
+const serverIdentity = Object.freeze({
+  instanceId: "11111111-1111-4111-8111-111111111111",
+  instanceLabel: "test-server",
+  instanceFingerprint: "1111111111",
+  connectionFingerprint: "2222222222",
+  connectionName: "VSPiLink — test-server · 2222222222",
+  connectionKey: "vspilink-test-server-2222222222",
+  serverUrl: "https://mcp.test.example",
+});
+
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "pilink-tool-contract-"));
   const workspace = path.join(root, "workspace");
@@ -86,6 +96,11 @@ test("system guidance keeps agents in the autonomous collaboration pull loop", a
     undefined,
     "autonomy-instance",
     tasks,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    serverIdentity,
   );
   const client = new Client({ name: "autonomy-guidance-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -104,6 +119,17 @@ test("system guidance keeps agents in the autonomous collaboration pull loop", a
   assert.match(guidance, /stop merely because one task reached a terminal state/);
   assert.match(guidance, /Escalate to the user only for a genuine unresolved product decision/);
   assert.match(guidance, /concrete dependency, role, authorization, scope-conflict, or input reason/);
+  assert.match(guidance, /VSPiLink — test-server · 2222222222/);
+  assert.match(guidance, /Endpoint: https:\/\/mcp\.test\.example/);
+
+  const identity = await client.callTool({ name: "server_identity", arguments: {} });
+  assert.notEqual(identity.isError, true);
+  assert.equal(identity.structuredContent.connection_name, serverIdentity.connectionName);
+  assert.equal(identity.structuredContent.workspace, value.workspace);
+  assert.equal(
+    identity._meta["cc.eu.funboy.vspilink/instance"].connection_fingerprint,
+    serverIdentity.connectionFingerprint,
+  );
 });
 
 function validateSchemaDocumentation(schema, location, requirePropertyDescriptions) {

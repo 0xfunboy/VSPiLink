@@ -1,10 +1,10 @@
-export const CHATGPT_DESTINATIONS = ["security", "plugins", "work"] as const;
+export const CHATGPT_DESTINATIONS = ["security", "plugins", "chat"] as const;
 export type ChatGptDestination = (typeof CHATGPT_DESTINATIONS)[number];
 
 export const CHATGPT_LINKS: Readonly<Record<ChatGptDestination, string>> = Object.freeze({
   security: "https://chatgpt.com/#settings/Security",
   plugins: "https://chatgpt.com/plugins",
-  work: "https://chatgpt.com/?surface=work",
+  chat: "https://chatgpt.com/?surface=chat",
 });
 
 export interface ChatGptNavigation {
@@ -21,13 +21,12 @@ export function chatGptUrl(destination: ChatGptDestination): string {
 }
 
 /**
- * ChatGPT Work is deliberately opened without a reuse filter so the primary
- * MCP surface gets its own editor. Setup pages can safely share their existing
- * ChatGPT browser editor.
+ * Normal Chat gets its own integrated-browser editor. Setup pages can safely
+ * share their existing ChatGPT browser editor.
  */
 export function chatGptNavigation(destination: ChatGptDestination): ChatGptNavigation {
   const url = chatGptUrl(destination);
-  return destination === "work"
+  return destination === "chat"
     ? { url }
     : { url, reuseUrlFilter: "https://chatgpt.com/**" };
 }

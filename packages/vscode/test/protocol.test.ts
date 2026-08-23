@@ -139,6 +139,17 @@ test("parseWebviewMessage validates and normalizes wizard actions", () => {
   });
   assert.deepEqual(parseWebviewMessage({
     type: "wizard",
+    action: "copyCredential",
+    requestId: "copy-description",
+    field: "connectionDescription",
+  }), {
+    type: "wizard",
+    action: "copyCredential",
+    requestId: "copy-description",
+    field: "connectionDescription",
+  });
+  assert.deepEqual(parseWebviewMessage({
+    type: "wizard",
     action: "confirmDeveloperMode",
     requestId: "developer-mode-1",
   }), {

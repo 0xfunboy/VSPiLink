@@ -296,6 +296,13 @@ function configSnapshot(port: number): ConfigSnapshot {
     hostingMode: "quick-tunnel",
     unsafeFullAccess: false,
     serverUrl: `http://127.0.0.1:${port}`,
+    instanceId: "11111111-1111-4111-8111-111111111111",
+    instanceLabel: "test-server",
+    instanceSlug: "test-server",
+    instanceFingerprint: "1111111111",
+    connectionFingerprint: "2222222222",
+    connectionName: "VSPiLink — test-server · 2222222222",
+    connectionKey: "vspilink-test-server-2222222222",
     bootstrapSecret: "b".repeat(32),
     clients: [],
   };

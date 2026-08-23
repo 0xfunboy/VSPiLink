@@ -62,6 +62,7 @@ export function createOAuthRouter(): Router {
     const serverUrl = config.serverUrl;
     res.json({
       issuer: serverUrl,
+      authorization_response_iss_parameter_supported: true,
       authorization_endpoint: `${serverUrl}/oauth/authorize`,
       token_endpoint: `${serverUrl}/oauth/token`,
       revocation_endpoint: `${serverUrl}/oauth/revoke`,
@@ -88,9 +89,12 @@ export function createOAuthRouter(): Router {
 
   // ── RFC 9728: Protected Resource Metadata ──────────────────
   const sendProtectedResourceMetadata = (_req: Request, res: Response) => {
-    const serverUrl = loadRuntimeConfig().serverUrl;
+    const config = loadRuntimeConfig();
+    const serverUrl = config.serverUrl;
     res.json({
       resource: serverUrl,
+      resource_name: config.connectionName,
+      resource_documentation: `${serverUrl}/.well-known/vspilink-instance`,
       authorization_servers: [serverUrl],
       scopes_supported: RESOURCE_SCOPES,
       bearer_methods_supported: ["header"],
@@ -151,6 +155,7 @@ export function createOAuthRouter(): Router {
       state,
       code_challenge,
       code_challenge_method,
+      resource,
     } = req.query as Record<string, unknown>;
 
     log(`Authorize request: client=${maskClientId(client_id)} response_type=${response_type}`);
@@ -165,13 +170,18 @@ export function createOAuthRouter(): Router {
       !optionalOAuthText(scope, 512) ||
       !optionalOAuthText(state, 4_096) ||
       !boundedOAuthText(code_challenge, 256) ||
-      !boundedOAuthText(code_challenge_method, 32)
+      !boundedOAuthText(code_challenge_method, 32) ||
+      !optionalOAuthText(resource, 2_048)
     ) {
       res.status(400).json({ error: "invalid_request", error_description: "OAuth parameters must be bounded strings" });
       return;
     }
 
     const config = loadRuntimeConfig();
+    if (resource !== undefined && !isExpectedResource(resource, config.serverUrl)) {
+      res.status(400).json({ error: "invalid_target", error_description: "Invalid OAuth resource" });
+      return;
+    }
     if (config.oauthConsentMode === "paired" && !hasOwnerSession(req)) {
       res.status(403).type("html").send(renderPairingRequired());
       return;
@@ -204,6 +214,7 @@ export function createOAuthRouter(): Router {
       state: state || "",
       code_challenge: code_challenge || "",
       code_challenge_method: code_challenge_method || "",
+      resource: resource || "",
     });
     const html = renderConsentPage(
       client.client_name,
@@ -214,6 +225,10 @@ export function createOAuthRouter(): Router {
       code_challenge || "",
       code_challenge_method || "",
       consentToken,
+      resource || "",
+      config.connectionName,
+      config.connectionFingerprint,
+      config.serverUrl,
     );
     setConsentRedirectPolicy(res, redirect_uri || client.redirect_uris[0]);
     res.type("html").send(html);
@@ -230,6 +245,7 @@ export function createOAuthRouter(): Router {
       code_challenge,
       code_challenge_method,
       consent_token,
+      resource,
     } = req.body;
 
     log(`Consent POST: action=${action} client=${maskClientId(client_id)}`);
@@ -242,13 +258,18 @@ export function createOAuthRouter(): Router {
       !optionalOAuthText(state, 4_096) ||
       !boundedOAuthText(code_challenge, 256) ||
       !boundedOAuthText(code_challenge_method, 32) ||
-      !boundedOAuthText(consent_token, 256)
+      !boundedOAuthText(consent_token, 256) ||
+      !optionalOAuthText(resource, 2_048)
     ) {
       res.status(400).json({ error: "invalid_request", error_description: "OAuth consent parameters are invalid" });
       return;
     }
 
     const config = loadRuntimeConfig();
+    if (resource !== undefined && !isExpectedResource(resource, config.serverUrl)) {
+      res.status(400).json({ error: "invalid_target", error_description: "Invalid OAuth resource" });
+      return;
+    }
     if (config.oauthConsentMode === "paired" && !hasOwnerSession(req)) {
       res.status(403).json({ error: "access_denied", error_description: "Owner pairing is required" });
       return;
@@ -271,6 +292,7 @@ export function createOAuthRouter(): Router {
       state: state || "",
       code_challenge,
       code_challenge_method,
+      resource: resource || "",
     })) {
       res.status(400).json({ error: "invalid_request", error_description: "Consent request is missing, expired, or already used" });
       return;
@@ -279,6 +301,7 @@ export function createOAuthRouter(): Router {
       const deniedUrl = new URL(redirect_uri);
       deniedUrl.searchParams.set("error", "access_denied");
       if (state) deniedUrl.searchParams.set("state", state);
+      deniedUrl.searchParams.set("iss", config.serverUrl);
       setConsentRedirectPolicy(res, redirect_uri);
       res.redirect(303, deniedUrl.toString());
       return;
@@ -288,6 +311,7 @@ export function createOAuthRouter(): Router {
       client_id,
       effectiveClientTokenVersion(client),
       redirect_uri,
+      resource || undefined,
       resolvedScope,
       code_challenge,
       "S256"
@@ -296,6 +320,7 @@ export function createOAuthRouter(): Router {
     const callbackUrl = new URL(redirect_uri);
     callbackUrl.searchParams.set("code", code);
     if (state) callbackUrl.searchParams.set("state", state);
+    callbackUrl.searchParams.set("iss", config.serverUrl);
 
     log(`Authorization code issued for client '${maskClientId(client_id)}'`);
     recordOAuthActivity(client_id, "authorized");
@@ -306,7 +331,13 @@ export function createOAuthRouter(): Router {
   // ── Token Endpoint ─────────────────────────────────────────
   router.post("/oauth/token", asyncRoute(async (req: Request, res: Response) => {
     const { grant_type } = req.body;
+    const config = loadRuntimeConfig();
     log(`Token request: grant_type=${grant_type}`);
+
+    if (req.body.resource !== undefined && !isExpectedResource(req.body.resource, config.serverUrl)) {
+      res.status(400).json({ error: "invalid_target", error_description: "Invalid OAuth resource" });
+      return;
+    }
 
     // Client Credentials Grant
     if (grant_type === "client_credentials") {
@@ -363,6 +394,11 @@ export function createOAuthRouter(): Router {
       const authCode = peekAuthorizationCode(code);
       if (!authCode) {
         res.status(400).json({ error: "invalid_grant", error_description: "Invalid or expired authorization code" });
+        return;
+      }
+
+      if ((authCode.resource || undefined) !== (req.body.resource || undefined)) {
+        res.status(400).json({ error: "invalid_target", error_description: "OAuth resource mismatch" });
         return;
       }
 
@@ -537,18 +573,18 @@ export function createOAuthRouter(): Router {
     }
     const config = loadRuntimeConfig();
     const bootstrapRegistration = isLocalAdminRequest(req) && hasBootstrapAccess(req, config.bootstrapSecret);
-    const publicChatGptDcr = !bootstrapRegistration && config.publicChatGptDcr && isPublicChatGptDcrRequest(req.body);
-    if (!bootstrapRegistration && !publicChatGptDcr) {
+    const publicOpenAiDcr = !bootstrapRegistration && config.publicChatGptDcr && isPublicOpenAiDcrRequest(req.body);
+    if (!bootstrapRegistration && !publicOpenAiDcr) {
       res.status(401).set("WWW-Authenticate", "Bearer").json({ error: "invalid_token", error_description: "A registration access token is required" });
       return;
     }
 
-    const resolvedGrantTypes = publicChatGptDcr
+    const resolvedGrantTypes = publicOpenAiDcr
       ? ["authorization_code", "refresh_token"]
       : grant_types || ["client_credentials"];
     const resolvedRedirectUris = redirect_uris || [];
-    const resolvedScope = publicChatGptDcr ? "mcp:tools offline_access" : scope || "mcp:tools";
-    const resolvedAuthMethod: NonNullable<OAuthClient["token_endpoint_auth_method"]> = publicChatGptDcr
+    const resolvedScope = publicOpenAiDcr ? "mcp:tools offline_access" : scope || "mcp:tools";
+    const resolvedAuthMethod: NonNullable<OAuthClient["token_endpoint_auth_method"]> = publicOpenAiDcr
       ? "none"
       : token_endpoint_auth_method || "client_secret_post";
 
@@ -580,8 +616,8 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    if (publicChatGptDcr) {
-      const existing = reusablePublicChatGptClient(resolvedRedirectUris[0]);
+    if (publicOpenAiDcr) {
+      const existing = reusablePublicOpenAiClient(resolvedRedirectUris[0]);
       if (existing) {
         res.status(201).json(publicClientRegistrationResponse(existing));
         return;
@@ -590,10 +626,10 @@ export function createOAuthRouter(): Router {
         client.disabled_at === undefined &&
         client.token_endpoint_auth_method === "none" &&
         client.redirect_uris.length === 1 &&
-        isChatGptConnectorRedirect(client.redirect_uris[0])
+        isPublicOpenAiRedirect(client.redirect_uris[0])
       );
       if (publicDcrClients.length >= 64) {
-        res.status(429).json({ error: "registration_limit_reached", error_description: "Too many pending ChatGPT clients" });
+        res.status(429).json({ error: "registration_limit_reached", error_description: "Too many pending OpenAI MCP clients" });
         return;
       }
     }
@@ -614,6 +650,7 @@ export function createOAuthRouter(): Router {
       client_name: client.client_name,
       redirect_uris: client.redirect_uris,
       grant_types: client.grant_types,
+      ...(client.grant_types.includes("authorization_code") ? { response_types: ["code"] } : {}),
       token_endpoint_auth_method: client.token_endpoint_auth_method,
       scope: client.scope,
       ...(resolvedAuthMethod === "none" ? {} : { client_secret, client_secret_expires_at: 0 }),
@@ -623,14 +660,14 @@ export function createOAuthRouter(): Router {
   return router;
 }
 
-function isPublicChatGptDcrRequest(value: unknown): value is Record<string, unknown> {
+function isPublicOpenAiDcrRequest(value: unknown): value is Record<string, unknown> {
   if (!isPlainRecord(value)) return false;
   const redirectUris = value.redirect_uris;
   const grantTypes = value.grant_types;
   const requestedScope = value.scope;
   const authMethod = value.token_endpoint_auth_method;
   return safeOAuthDisplayText(value.client_name, 120) &&
-    Array.isArray(redirectUris) && redirectUris.length === 1 && isChatGptConnectorRedirect(redirectUris[0]) &&
+    Array.isArray(redirectUris) && redirectUris.length === 1 && isPublicOpenAiRedirect(redirectUris[0]) &&
     (grantTypes === undefined || (
       Array.isArray(grantTypes) && grantTypes.length >= 1 && grantTypes.length <= 2 &&
       grantTypes.includes("authorization_code") &&
@@ -659,7 +696,23 @@ function isChatGptConnectorRedirect(value: unknown): value is string {
   }
 }
 
-function reusablePublicChatGptClient(redirectUri: string): OAuthClient | undefined {
+function isChatGptStableRedirect(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname.toLowerCase() === "chatgpt.com" &&
+      !url.username && !url.password && !url.search && !url.hash &&
+      url.pathname === "/connector_platform_oauth_redirect";
+  } catch {
+    return false;
+  }
+}
+
+function isPublicOpenAiRedirect(value: unknown): value is string {
+  return isChatGptConnectorRedirect(value) || isChatGptStableRedirect(value);
+}
+
+function reusablePublicOpenAiClient(redirectUri: string): OAuthClient | undefined {
   return loadClients().find((client) =>
     client.disabled_at === undefined &&
     client.token_endpoint_auth_method === "none" &&
@@ -676,6 +729,7 @@ function publicClientRegistrationResponse(client: OAuthClient): Record<string, u
     client_name: client.client_name,
     redirect_uris: client.redirect_uris,
     grant_types: client.grant_types,
+    response_types: ["code"],
     token_endpoint_auth_method: "none",
     scope: client.scope,
   };
@@ -719,6 +773,10 @@ function boundedOAuthText(value: unknown, maximumBytes: number): value is string
 
 function optionalOAuthText(value: unknown, maximumBytes: number): value is string | undefined {
   return value === undefined || boundedOAuthText(value, maximumBytes);
+}
+
+function isExpectedResource(value: unknown, expected: string): value is string {
+  return boundedOAuthText(value, 2_048) && value === expected;
 }
 
 function safeOAuthDisplayText(value: unknown, maximumBytes: number): value is string {
@@ -801,6 +859,7 @@ interface ConsentFields {
   state: string;
   code_challenge: string;
   code_challenge_method: string;
+  resource: string;
 }
 
 function createConsentRequest(fields: ConsentFields): string {
@@ -869,6 +928,10 @@ function renderConsentPage(
   codeChallenge: string,
   codeChallengeMethod: string,
   consentToken: string,
+  resource: string,
+  serverName: string,
+  serverFingerprint: string,
+  serverUrl: string,
 ): string {
   const scopes = scope.split(" ").filter(Boolean);
   const scopeList = scopes.map((s) => `<li>${escapeHtml(s)}</li>`).join("\n");
@@ -878,7 +941,7 @@ function renderConsentPage(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>PiLink Authorization</title>
+  <title>${escapeHtml(serverName)} Authorization</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
@@ -895,6 +958,10 @@ function renderConsentPage(
     .logo { font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem; }
     .logo span { color: #10b981; }
     .subtitle { color: #8888a0; font-size: 0.9rem; margin-bottom: 1.8rem; }
+    .server-target { margin-bottom: 1.2rem; padding: 0.85rem 1rem; border: 1px solid rgba(142, 168, 255, 0.28); border-radius: 8px; background: rgba(142, 168, 255, 0.08); }
+    .server-target span { display: block; color: #8888a0; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
+    .server-target strong { display: block; margin-top: 0.25rem; color: #dfe5ff; }
+    .server-target code { display: block; margin-top: 0.35rem; color: #9eaadb; font-size: 0.76rem; overflow-wrap: anywhere; }
     .client-name {
       background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25);
       border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-weight: 600; font-size: 1.05rem;
@@ -918,6 +985,7 @@ function renderConsentPage(
   <div class="card">
     <div class="logo">PI<span>-MCP</span></div>
     <p class="subtitle">Authorization Request (Pi Agent Harness)</p>
+    <div class="server-target"><span>Exact VSPiLink target</span><strong>${escapeHtml(serverName)}</strong><code>${escapeHtml(serverUrl)} · ${escapeHtml(serverFingerprint)}</code></div>
     <div class="client-name">${escapeHtml(clientName)}</div>
     <h3>Requested Permissions</h3>
     <ul>${scopeList}</ul>
@@ -929,6 +997,7 @@ function renderConsentPage(
       <input type="hidden" name="code_challenge" value="${escapeHtml(codeChallenge)}">
       <input type="hidden" name="code_challenge_method" value="${escapeHtml(codeChallengeMethod)}">
       <input type="hidden" name="consent_token" value="${escapeHtml(consentToken)}">
+      ${resource ? `<input type="hidden" name="resource" value="${escapeHtml(resource)}">` : ""}
       <div class="buttons">
         <button type="submit" name="action" value="deny" class="deny">Deny</button>
         <button type="submit" name="action" value="approve" class="approve">Approve</button>

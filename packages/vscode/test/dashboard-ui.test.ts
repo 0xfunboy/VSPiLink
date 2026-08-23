@@ -78,21 +78,23 @@ test("real renders preserve transcript, composer and disclosure state", () => {
   assert.match(functionSource("renderLogsDisclosure"), /renderStateKey = "logs"/);
 });
 
-test("the primary onboarding follows ChatGPT Work and keeps legacy setup secondary", () => {
+test("the primary onboarding creates one normal-Chat connection per server", () => {
   assert.doesNotMatch(
     script,
     /Apps\s*(?:→|->)\s*Create|Workspace settings|Enterprise\/Edu|Scan Tools|admin\/ca/i,
   );
   const guide = functionSource("renderChatGptConnectionGuide");
-  assert.match(guide, /Connect ChatGPT Work to this workspace/);
-  assert.match(guide, /Open ChatGPT Work/);
-  assert.match(guide, /Install or connect the private VSPiLink plugin/);
-  assert.match(guide, /personal or workspace plugin source/);
+  assert.match(guide, /Connect normal ChatGPT Chat to this machine/);
+  assert.match(guide, /Open ChatGPT Plugins/);
+  assert.match(guide, /Create this server-specific VSPiLink connection/);
+  assert.match(guide, /Name, Description, and MCP endpoint/);
+  assert.match(guide, /exact name/);
   assert.match(guide, /Searching for “mcp server” will show other vendors/);
-  assert.match(guide, /Legacy Developer Mode compatibility/);
-  assert.match(guide, /supported primary Work flow/);
-  assert.match(guide, /destination: "work"/);
+  assert.match(guide, /If the \+ button is missing/);
+  assert.doesNotMatch(guide, /not available in normal Chat/);
+  assert.doesNotMatch(guide, /destination: "work"/);
   assert.match(guide, /destination: "plugins"/);
+  assert.match(guide, /connectionDescription/);
   const oauth = functionSource("renderCallbackStep");
   assert.match(oauth, /Dynamic Client Registration \(DCR\)/);
   assert.match(oauth, /you do not need to find or copy it/);
@@ -148,7 +150,9 @@ test("the remote monitor separates MCP connections from observed agent identitie
   const workspace = functionSource("renderChatGptWorkspace");
   assert.match(workspace, /!currentState\.externalMcp\.configured/);
   assert.match(workspace, /the callback does not need to be entered again/);
-  assert.match(workspace, /The OAuth client is already registered/);
+  assert.match(workspace, /Authorize once in browser/);
+  assert.match(workspace, /currentState\.connectionFingerprint/);
+  assert.match(workspace, /currentState\.mcpUrl/);
   assert.match(workspace, /Write in the main ChatGPT tab/);
   assert.match(workspace, /No coordination activity yet/);
   assert.match(workspace, /MCP calls and messages published by agents will appear here automatically/);
@@ -212,7 +216,9 @@ test("ChatGPT is primary while local provider, new chat and stop remain availabl
   const initialize = functionSource("initialize");
   assert.match(initialize, /"ChatGPT MCP"/);
   assert.match(initialize, /"Pi Local"/);
-  assert.match(initialize, /makeButton\("Open ChatGPT Work", "openChatGpt"/);
+  assert.match(initialize, /makeButton\("Open ChatGPT Chat", "openChatGpt"/);
+  assert.match(script, /Authorize once in browser/);
+  assert.match(script, /VS Code blocks OAuth popups/);
 
   const local = functionSource("renderLocalModeIntro");
   assert.match(local, /makeButton\("Provider and model", "configureAgents"/);

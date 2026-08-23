@@ -17,6 +17,7 @@ export interface AuthorizationCode {
   client_id: string;
   client_version: number;
   redirect_uri: string;
+  resource?: string;
   scope: string;
   code_challenge: string;
   code_challenge_method: "S256" | "plain";

@@ -49,16 +49,14 @@ test("new chat tombstones the old selection and cancels before stop", () => {
   assert.match(state, /selectionGeneration !== this\.chatSelectionGeneration/);
 });
 
-test("ChatGPT MCP connection is primary and opens the real VS Code integrated browser", () => {
+test("ChatGPT MCP setup uses the system browser once and daily chat stays in VS Code", () => {
   const browser = methodSource("openIntegratedBrowser");
-  assert.match(browser, /getCommands\(true\)/);
   assert.match(browser, /workbench\.action\.browser\.open/);
   assert.match(browser, /openToSide: true/);
   assert.match(browser, /reuseUrlFilter\?: string/);
   assert.match(browser, /\.\.\.\(reuseUrlFilter \? \{ reuseUrlFilter \} : \{\}\)/);
-  assert.match(browser, /vscode\.env\.openExternal/);
-  assert.match(browser, /Open in system browser/);
-  assert.match(browser, /action !== "Open in system browser"/);
+  assert.doesNotMatch(browser, /vscode\.env\.openExternal/);
+  assert.match(browser, /integrated browser is unavailable/);
   assert.match(browser, /try \{/);
   assert.match(browser, /catch \{/);
   assert.doesNotMatch(browser, /simpleBrowser|webview|iframe/i);
@@ -66,14 +64,14 @@ test("ChatGPT MCP connection is primary and opens the real VS Code integrated br
   const connect = methodSource("connectChatGpt");
   assert.match(connect, /state\.externalMcp\.configured/);
   assert.match(connect, /state\.externalMcp\.connected/);
-  assert.match(connect, /this\.openChatGpt\("work"\)/);
+  assert.match(connect, /this\.openChatGpt\("chat"\)/);
   assert.match(connect, /this\.wizard\.resumeRuntime/);
   assert.match(connect, /clipboard\.writeText\(state\.mcpUrl\)/);
-  assert.match(connect, /destination: "work"/);
+  assert.match(connect, /destination: "plugins"/);
   assert.doesNotMatch(connect, /configureAgents/);
 
   const openChat = methodSource("openChatGptInVsCode");
-  assert.match(openChat, /this\.openChatGpt\("work"\)/);
+  assert.match(openChat, /this\.openChatGpt\("chat"\)/);
 
   const navigate = methodSource("openChatGpt");
   assert.match(navigate, /chatGptNavigation\(destination\)/);
@@ -81,13 +79,22 @@ test("ChatGPT MCP connection is primary and opens the real VS Code integrated br
   assert.doesNotMatch(navigate, /"https:\/\/chatgpt\.com\/\*\*"/);
 
   const pairing = methodSource("pairWizardOwner");
-  assert.match(pairing, /requirePersistentBrowserStorage\(\)/);
   assert.match(pairing, /searchParams\.set\("continue", navigation\.url\)/);
-  assert.match(pairing, /openIntegratedBrowser\(/);
+  assert.match(pairing, /vscode\.env\.openExternal/);
+  assert.doesNotMatch(pairing, /openIntegratedBrowser\(/);
+  assert.match(pairing, /After approval, ChatGPT returns inside VS Code automatically/);
 
   const storage = methodSource("requirePersistentBrowserStorage");
   assert.match(storage, /storage !== "ephemeral"/);
   assert.match(storage, /workbench\.browser\.dataStorage/);
+
+  const state = methodSource("dashboardState");
+  assert.match(state, /chatGptAuthorized && this\.returnToIntegratedChatAfterOAuth/);
+  assert.match(state, /this\.returnToIntegratedChatAfterOAuth = false/);
+  assert.match(state, /void this\.openChatGpt\("chat"\)\.catch/);
+
+  assert.match(pairing, /destination === "plugins"/);
+  assert.match(pairing, /this\.returnToIntegratedChatAfterOAuth = true/);
 
   const monitor = methodSource("openCollaborationMonitor");
   assert.match(monitor, /shellArgs: \[cliPath, "chat"\]/);
@@ -95,4 +102,27 @@ test("ChatGPT MCP connection is primary and opens the real VS Code integrated br
   assert.match(monitor, /samePath\(snapshot\.workspace, workspacePath\)/);
   assert.match(monitor, /isPathInside\(snapshot\.workspace, snapshot\.dataDir\)/);
   assert.doesNotMatch(monitor, /configureAgents|setupChat/);
+});
+
+test("external OAuth deep links are routed through the configured server and integrated browser", () => {
+  const registration = methodSource("registerUriHandler");
+  assert.match(registration, /registerUriHandler/);
+  assert.match(registration, /handleExternalUri/);
+
+  const handler = methodSource("handleExternalUri");
+  assert.match(handler, /uri\.path !== "\/open-oauth"/);
+  assert.match(handler, /externalUriTarget\(uri\.query\)/);
+  assert.match(handler, /validateExternalOAuthUrl/);
+  assert.match(handler, /requirePersistentBrowserStorage/);
+  assert.match(handler, /openOAuthInVsCode/);
+
+  const oauthBrowser = methodSource("openOAuthInVsCode");
+  assert.match(oauthBrowser, /workbench\.action\.browser\.open/);
+  assert.match(oauthBrowser, /simpleBrowser\.api\.open/);
+  assert.doesNotMatch(oauthBrowser, /vscode\.env\.openExternal/);
+
+  assert.match(source, /target\.origin !== expected\.origin/);
+  assert.match(source, /target\.pathname !== "\/oauth\/authorize"/);
+  assert.match(source, /target\.pathname !== "\/oauth\/pair"/);
+  assert.match(source, /query\.slice\(4\)/);
 });

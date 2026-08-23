@@ -1,5 +1,5 @@
 import dotenv from "dotenv";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +10,13 @@ export interface RuntimeConfig {
   port: number;
   host: string;
   serverUrl: string;
+  instanceId: string;
+  instanceLabel: string;
+  instanceSlug: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionKey: string;
   landingHostname?: string;
   workspace: string;
   dataDir: string;
@@ -128,14 +135,17 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     throw new Error("SERVER_URL must be an absolute http(s) URL");
   }
 
+  const normalizedServerUrl = serverUrl.replace(/\/$/, "");
   const activeConfigPath = env.PILINK_CONFIG || defaultConfigPath();
   const dataDir = path.resolve(env.PI_DATA_DIR || path.dirname(activeConfigPath));
   const fullAccessClientIds = parseFullAccessClientIds(env.PI_FULL_ACCESS_CLIENT_IDS);
+  const identity = resolveInstanceIdentity(env, workspace, normalizedServerUrl, jwtSecret);
 
   return {
     port,
     host,
-    serverUrl: serverUrl.replace(/\/$/, ""),
+    serverUrl: normalizedServerUrl,
+    ...identity,
     ...(landingHostname ? { landingHostname } : {}),
     workspace,
     dataDir,
@@ -165,6 +175,89 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     agentThinkingLevel: agentThinkingLevel as RuntimeConfig["agentThinkingLevel"],
     maxConcurrentAgents,
   };
+}
+
+export interface InstanceIdentity {
+  instanceId: string;
+  instanceLabel: string;
+  instanceSlug: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionKey: string;
+}
+
+export function createInstanceId(): string {
+  return randomUUID();
+}
+
+export function defaultInstanceLabel(workspace: string, hostname = os.hostname()): string {
+  const project = path.basename(path.resolve(workspace));
+  const combined = `${hostname}-${project}`
+    .normalize("NFKD")
+    .replace(/[^a-z0-9._ -]+/giu, "-")
+    .replace(/[\s._-]+/gu, "-")
+    .replace(/^-+|-+$/gu, "")
+    .slice(0, 48);
+  return combined || "server";
+}
+
+export function resolveInstanceIdentity(
+  env: NodeJS.ProcessEnv,
+  workspace: string,
+  serverUrl: string,
+  jwtSecret: string,
+): InstanceIdentity {
+  const instanceId = env.PI_INSTANCE_ID
+    ? normalizeInstanceId(env.PI_INSTANCE_ID)
+    : deterministicInstanceId(`legacy\0${jwtSecret}`);
+  const instanceLabel = env.PI_INSTANCE_LABEL
+    ? normalizeInstanceLabel(env.PI_INSTANCE_LABEL)
+    : defaultInstanceLabel(workspace);
+  const instanceSlug = slug(instanceLabel, 24);
+  const instanceFingerprint = fingerprint(`instance\0${instanceId}`);
+  const connectionFingerprint = fingerprint(`connection\0${instanceId}\0${new URL(serverUrl).origin}`);
+  return Object.freeze({
+    instanceId,
+    instanceLabel,
+    instanceSlug,
+    instanceFingerprint,
+    connectionFingerprint,
+    connectionName: `VSPiLink — ${instanceLabel} · ${connectionFingerprint}`,
+    connectionKey: `vspilink-${instanceSlug}-${connectionFingerprint}`,
+  });
+}
+
+function normalizeInstanceId(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(normalized)) {
+    throw new Error("PI_INSTANCE_ID must be a canonical UUID");
+  }
+  return normalized;
+}
+
+function normalizeInstanceLabel(value: string): string {
+  const normalized = value.trim();
+  if (!/^[a-z0-9][a-z0-9._ -]{0,63}$/iu.test(normalized)) {
+    throw new Error("PI_INSTANCE_LABEL must be 1-64 safe display characters");
+  }
+  return normalized;
+}
+
+function deterministicInstanceId(seed: string): string {
+  const bytes = Buffer.from(createHash("sha256").update(seed, "utf8").digest("hex").slice(0, 32), "hex");
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function fingerprint(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 10);
+}
+
+function slug(value: string, maxLength: number): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "").slice(0, maxLength) || "server";
 }
 
 export function parseFullAccessClientIds(value: string | undefined): readonly string[] {

@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -55,6 +54,7 @@ class ExtensionController {
   private chatSetupInFlight?: Promise<boolean>;
   private chatCommandBusy = false;
   private collaborationMonitor?: { terminal: vscode.Terminal; configPath: string; workspace: string };
+  private returnToIntegratedChatAfterOAuth = false;
   private disposing = false;
 
   constructor(private readonly context: vscode.ExtensionContext) {
@@ -88,6 +88,7 @@ class ExtensionController {
   async activate(): Promise<void> {
     this.registerViews();
     this.registerCommands();
+    this.registerUriHandler();
     this.registerNativeMcpProvider();
 
     this.disposables.push(
@@ -176,6 +177,60 @@ class ExtensionController {
     register("viewAgentOutput", (agentId) => this.viewAgentOutput(typeof agentId === "string" ? agentId : ""));
   }
 
+  private registerUriHandler(): void {
+    this.disposables.push(vscode.window.registerUriHandler({
+      handleUri: async (uri) => {
+        try {
+          await this.handleExternalUri(uri);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "unknown error";
+          void vscode.window.showErrorMessage(`VSPiLink could not open the OAuth page: ${message}`);
+        }
+      },
+    }));
+  }
+
+  private async handleExternalUri(uri: vscode.Uri): Promise<void> {
+    this.requireTrustedWorkspace();
+    if (uri.path !== "/open-oauth") throw new Error("unsupported VSPiLink link");
+    const rawTarget = externalUriTarget(uri.query);
+    const target = validateExternalOAuthUrl(rawTarget, this.snapshot().serverUrl);
+    await this.requirePersistentBrowserStorage();
+    const origin = new URL(target).origin;
+    const opened = await this.openOAuthInVsCode(target, `${origin}/oauth/**`);
+    if (!opened) throw new Error("no internal VS Code browser is available");
+  }
+
+  /** OAuth pages are owned by this VSPiLink server and may safely use the
+   * built-in Simple Browser when the top-level Browser editor is unavailable.
+   * Never send this deep-link flow to the system browser. */
+  private async openOAuthInVsCode(url: string, reuseUrlFilter: string): Promise<boolean> {
+    const parsed = vscode.Uri.parse(url, true);
+    const commands = await vscode.commands.getCommands(true);
+    if (commands.includes("workbench.action.browser.open")) {
+      try {
+        await vscode.commands.executeCommand("workbench.action.browser.open", {
+          url: parsed.toString(true),
+          openToSide: true,
+          reuseUrlFilter,
+        });
+        return true;
+      } catch {
+        // The built-in Simple Browser below remains inside this VS Code window.
+      }
+    }
+    try {
+      await vscode.commands.executeCommand(
+        "simpleBrowser.api.open",
+        parsed,
+        { viewColumn: vscode.ViewColumn.Beside },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private registerNativeMcpProvider(): void {
     const provider: vscode.McpServerDefinitionProvider<vscode.McpHttpServerDefinition> = {
       onDidChangeMcpServerDefinitions: this.mcpChanged.event,
@@ -188,7 +243,7 @@ class ExtensionController {
         const token = await this.oauth.storedNativeToken(snapshot.configPath, scope);
         if (!token) return [];
         return [new vscode.McpHttpServerDefinition(
-          "VSPiLink",
+          snapshot.connectionName,
           vscode.Uri.parse(`${localServerUrl(snapshot)}/sse`),
           { Authorization: `Bearer ${token}` },
           this.mcpVersion(snapshot, scope),
@@ -240,6 +295,7 @@ class ExtensionController {
     const chatGptConfigured = persistedChatGptClients.length > 0 || chatGptActive;
     const chatGptAuthorized = persistedChatGptClients.some((client) => client.authorized);
     const chatGptConnected = chatGptAuthorized || chatGptActive;
+    const returnToIntegratedChat = chatGptAuthorized && this.returnToIntegratedChatAfterOAuth;
     const collaborationPromise = adminStatus.online && snapshot.bootstrapSecret
       ? readAdminCollaboration(snapshot.port, snapshot.bootstrapSecret).then(
           (value) => ({ available: true as const, ...value }),
@@ -267,6 +323,10 @@ class ExtensionController {
       collaborationPromise,
     ]);
     if (chatGptConnected) await this.wizard.noteChatGptConnected();
+    if (returnToIntegratedChat) {
+      this.returnToIntegratedChatAfterOAuth = false;
+      void this.openChatGpt("chat").catch(() => undefined);
+    }
     const processState = effectiveProcessState(
       this.supervisor.viewState,
       adminStatus.online,
@@ -278,6 +338,13 @@ class ExtensionController {
       trusted: vscode.workspace.isTrusted,
       workspace: snapshot.workspace,
       configPath: snapshot.configPath,
+      instanceId: snapshot.instanceId,
+      instanceLabel: snapshot.instanceLabel,
+      instanceFingerprint: snapshot.instanceFingerprint,
+      connectionFingerprint: snapshot.connectionFingerprint,
+      connectionName: snapshot.connectionName,
+      connectionDescription: chatGptConnectionDescription(snapshot),
+      connectionKey: snapshot.connectionKey,
       process: processState,
       health: health.online
         ? { online: true, ...stableDashboardHealth(health.payload) }
@@ -538,7 +605,7 @@ class ExtensionController {
     this.mcpChanged.fire();
     await this.dashboard.refresh();
     const action = await vscode.window.showInformationMessage(
-      `MCP server ready: ${runtime.mcpUrl}`,
+      `${this.snapshot(workspace).connectionName} is ready at ${runtime.mcpUrl}`,
       "Copy endpoint",
     );
     if (action === "Copy endpoint") await vscode.env.clipboard.writeText(runtime.mcpUrl);
@@ -574,9 +641,11 @@ class ExtensionController {
       return normalized;
     }
 
+    const instance = this.snapshot();
+    const instanceSuffix = `${instance.instanceSlug}-${instance.instanceFingerprint}`;
     const tunnelName = await vscode.window.showInputBox({
       title: "Cloudflare tunnel name",
-      value: "vspilink",
+      value: `vspilink-${instanceSuffix}`,
       placeHolder: "vspilink-client",
       ignoreFocusOut: true,
       validateInput: validateTunnelName,
@@ -591,16 +660,16 @@ class ExtensionController {
     if (!zoneName) return undefined;
     const mcpHostname = await vscode.window.showInputBox({
       title: "MCP server hostname",
-      value: `mcp.${zoneName.trim().toLowerCase()}`,
-      placeHolder: "mcp.example.com",
+      value: `mcp-${instanceSuffix}.${zoneName.trim().toLowerCase()}`,
+      placeHolder: "mcp-server-id.example.com",
       ignoreFocusOut: true,
       validateInput: (value) => validateHostnameInZone(value, zoneName),
     });
     if (!mcpHostname) return undefined;
     const landingHostname = await vscode.window.showInputBox({
       title: "VSPiLink page hostname",
-      value: `vspilink.${zoneName.trim().toLowerCase()}`,
-      placeHolder: "vspilink.example.com",
+      value: `vspilink-${instanceSuffix}.${zoneName.trim().toLowerCase()}`,
+      placeHolder: "vspilink-server-id.example.com",
       ignoreFocusOut: true,
       validateInput: (value) => {
         const invalid = validateHostnameInZone(value, zoneName);
@@ -698,7 +767,7 @@ class ExtensionController {
   private async copyMcpUrl(): Promise<void> {
     const state = await this.dashboardState();
     await vscode.env.clipboard.writeText(state.mcpUrl);
-    void vscode.window.showInformationMessage(`MCP URL copied: ${state.mcpUrl}`);
+    void vscode.window.showInformationMessage(`MCP URL copied for ${state.connectionName}: ${state.mcpUrl}`);
   }
 
   private async registerClient(): Promise<void> {
@@ -1059,7 +1128,6 @@ class ExtensionController {
   }
 
   private async pairWizardOwner(destination: ChatGptDestination): Promise<boolean> {
-    await this.requirePersistentBrowserStorage();
     const state = this.wizard.currentState;
     if (!state.publicUrl) throw new Error("The public VSPiLink host is unavailable for OAuth pairing.");
     const snapshot = this.wizardSnapshot(state);
@@ -1069,11 +1137,12 @@ class ExtensionController {
     const navigation = chatGptNavigation(destination);
     const pairedNavigation = new URL(pairingUrl);
     pairedNavigation.searchParams.set("continue", navigation.url);
-    const opened = await this.openIntegratedBrowser(
-      pairedNavigation.toString(),
-      `${state.publicUrl.replace(/\/$/u, "")}/oauth/pair*`,
+    const opened = await vscode.env.openExternal(vscode.Uri.parse(pairedNavigation.toString(), true));
+    if (!opened) throw new Error("The system browser did not open the one-time VSPiLink authorization page.");
+    if (destination === "plugins") this.returnToIntegratedChatAfterOAuth = true;
+    void vscode.window.showInformationMessage(
+      "Complete the one-time VSPiLink connection in your system browser. After approval, ChatGPT returns inside VS Code automatically.",
     );
-    if (!opened) throw new Error("The browser did not open the VSPiLink pairing page.");
     return true;
   }
 
@@ -1083,40 +1152,22 @@ class ExtensionController {
     if (!opened) throw new Error("The browser did not open the official ChatGPT page.");
   }
 
-  /**
-   * Open a real top-level browser editor, not an iframe-backed webview.  This
-   * keeps ChatGPT's login and the one-use PiLink owner cookie in the same VS
-   * Code browser profile.  Older VS Code builds fall back to the system
-   * browser without ever attempting the blocked Simple Browser embedding.
-   */
+  /** Open ChatGPT only in VS Code's top-level integrated browser editor. */
   private async openIntegratedBrowser(url: string, reuseUrlFilter?: string): Promise<boolean> {
     const parsed = vscode.Uri.parse(url, true);
-    const commands = await vscode.commands.getCommands(true);
-    let integratedBrowserFailed = false;
-    if (commands.includes("workbench.action.browser.open")) {
-      try {
-        await vscode.commands.executeCommand("workbench.action.browser.open", {
-          url: parsed.toString(true),
-          openToSide: true,
-          ...(reuseUrlFilter ? { reuseUrlFilter } : {}),
-        });
-        return true;
-      } catch {
-        integratedBrowserFailed = true;
-      }
+    try {
+      await vscode.commands.executeCommand("workbench.action.browser.open", {
+        url: parsed.toString(true),
+        openToSide: true,
+        ...(reuseUrlFilter ? { reuseUrlFilter } : {}),
+      });
+      return true;
+    } catch {
+      void vscode.window.showErrorMessage(
+        "VS Code's integrated browser is unavailable. Reload or update VS Code, then run the VSPiLink action again.",
+      );
+      return false;
     }
-    const action = await vscode.window.showWarningMessage(
-      integratedBrowserFailed
-        ? "VS Code's integrated browser could not open this page."
-        : "This version of VS Code does not provide the integrated browser required by VSPiLink.",
-      {
-        modal: true,
-        detail: "The system browser will open only if you choose it explicitly. During an SSH session, it may be on a different computer.",
-      },
-      "Open in system browser",
-    );
-    if (action !== "Open in system browser") return false;
-    return vscode.env.openExternal(parsed);
   }
 
   private async requirePersistentBrowserStorage(): Promise<void> {
@@ -1174,7 +1225,7 @@ class ExtensionController {
       });
       if (state.externalMcp.connected) {
         await this.wizard.noteChatGptConnected();
-        await this.openChatGpt("work");
+        await this.openChatGpt("chat");
         return;
       }
       await this.pairWizardOwner("plugins");
@@ -1189,11 +1240,14 @@ class ExtensionController {
       ...(hosting ? { hosting } : {}),
     });
     await vscode.env.clipboard.writeText(state.mcpUrl);
+    void vscode.window.showInformationMessage(
+      `Create a NEW ChatGPT connection named “${snapshot.connectionName}”. Its MCP endpoint is already copied. Do not reuse another server\'s VSPiLink connection.`,
+    );
     await this.wizard.handle({
       type: "wizard",
       action: "openChatGpt",
       requestId: `connect-${Date.now()}`,
-      destination: "work",
+      destination: "plugins",
     });
     await this.dashboard.refresh();
   }
@@ -1205,7 +1259,7 @@ class ExtensionController {
       await this.connectChatGpt();
       return;
     }
-    await this.openChatGpt("work");
+    await this.openChatGpt("chat");
   }
 
   private async registerChatGpt(callbackUrl: string) {
@@ -1214,7 +1268,7 @@ class ExtensionController {
     const health = await readHealth(snapshot.port);
     if (!health.online) throw new Error("Start VSPiLink before registering ChatGPT.");
     const registered = await this.oauth.registerExternalClient(snapshot, {
-      clientName: "ChatGPT VSPiLink",
+      clientName: snapshot.connectionName,
       grantTypes: ["authorization_code", "refresh_token"],
       redirectUris: [callbackUrl],
       allowedScope: "mcp:tools offline_access",
@@ -1236,6 +1290,8 @@ class ExtensionController {
     state: Readonly<PersistedWizardState>,
   ): Promise<string | undefined> {
     if (field === "mcpUrl") return state.mcpUrl;
+    if (field === "connectionName") return this.wizardSnapshot(state).connectionName;
+    if (field === "connectionDescription") return chatGptConnectionDescription(this.wizardSnapshot(state));
     if (field === "authorizationUrl") return state.publicUrl ? `${state.publicUrl.replace(/\/$/, "")}/oauth/authorize` : undefined;
     if (field === "tokenUrl") return state.publicUrl ? `${state.publicUrl.replace(/\/$/, "")}/oauth/token` : undefined;
     if (!state.configPath || !state.credential) return undefined;
@@ -2318,8 +2374,7 @@ class ExtensionController {
   }
 
   private mcpVersion(snapshot: ConfigSnapshot, scope: McpScope): string {
-    const configId = createHash("sha256").update(snapshot.configPath).digest("hex").slice(0, 12);
-    return `${this.context.extension.packageJSON.version || "1.1.0"}:${configId}:${scope}:${snapshot.port}`;
+    return `${this.context.extension.packageJSON.version || "1.1.0"}:${snapshot.connectionFingerprint}:${scope}:${snapshot.port}`;
   }
 
   private requireTrustedWorkspace(): void {
@@ -2420,6 +2475,10 @@ function validateTunnelId(value: string): string | undefined {
     : "Enter the complete Cloudflare tunnel UUID.";
 }
 
+function chatGptConnectionDescription(snapshot: ConfigSnapshot): string {
+  return `Coding agent for the ${snapshot.instanceLabel} workspace on ${os.hostname()} · target ${snapshot.connectionFingerprint}`;
+}
+
 function validatePairingUrl(value: string, expectedPublicUrl: string, expiresAt: string): string {
   let pairing: URL;
   let expected: URL;
@@ -2438,6 +2497,38 @@ function validatePairingUrl(value: string, expectedPublicUrl: string, expiresAt:
   const expiration = Date.parse(expiresAt);
   if (!Number.isFinite(expiration) || expiration <= Date.now()) throw new Error("The OAuth pairing request has already expired.");
   return pairing.toString();
+}
+
+function validateExternalOAuthUrl(value: string, expectedServerUrl: string): string {
+  let target: URL;
+  let expected: URL;
+  try {
+    target = new URL(value);
+    expected = new URL(expectedServerUrl);
+  } catch {
+    throw new Error("invalid OAuth URL");
+  }
+  const expectedOriginAllowed = expected.protocol === "https:" ||
+    (expected.protocol === "http:" && isLoopbackBrowserHost(expected.hostname));
+  if (
+    !expectedOriginAllowed || target.origin !== expected.origin || target.username || target.password || target.hash ||
+    (target.pathname !== "/oauth/authorize" && target.pathname !== "/oauth/pair")
+  ) throw new Error("OAuth URL does not belong to this VSPiLink server");
+  return target.toString();
+}
+
+/** VS Code decodes protocol-handler query strings once before delivering
+ * them to a remote extension. Keep every character after the sole `url=`
+ * field so nested OAuth `&` parameters are never mistaken for outer fields. */
+function externalUriTarget(query: string): string {
+  if (!query.startsWith("url=")) return "";
+  const value = query.slice(4);
+  if (/^https?:\/\//u.test(value)) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return "";
+  }
 }
 
 function isLoopbackBrowserHost(hostname: string): boolean {

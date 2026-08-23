@@ -61,6 +61,8 @@ test("wizard provisioning creates paired private configuration and manages two c
   });
   const custom = parseEnv(fs.readFileSync(configPath, "utf8"));
   assert.equal(custom.PI_WORK_DIR, workspace);
+  assert.match(custom.PI_INSTANCE_ID || "", /^[0-9a-f-]{36}$/u);
+  assert.ok((custom.PI_INSTANCE_LABEL || "").length > 0);
   assert.equal(custom.PORT, "4321");
   assert.equal(custom.PI_HOSTING_MODE, "external");
   assert.equal(custom.SERVER_URL, "https://mcp.example.test");
@@ -84,6 +86,8 @@ test("wizard provisioning creates paired private configuration and manages two c
   assert.equal(quick.TRUST_PROXY, "true");
   assert.equal(quick.JWT_SECRET, custom.JWT_SECRET);
   assert.equal(quick.PI_BOOTSTRAP_SECRET, custom.PI_BOOTSTRAP_SECRET);
+  assert.equal(quick.PI_INSTANCE_ID, custom.PI_INSTANCE_ID);
+  assert.equal(quick.PI_INSTANCE_LABEL, custom.PI_INSTANCE_LABEL);
 });
 
 test("updateEnvValue replaces or appends values and round-trips serialization", () => {
@@ -225,6 +229,11 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
   assert.equal(snapshot.dataDir, dataDir);
   assert.equal(snapshot.port, 4321);
   assert.equal(snapshot.serverUrl, "http://127.0.0.1:4321");
+  assert.match(snapshot.instanceId, /^[0-9a-f-]{36}$/u);
+  assert.match(snapshot.instanceFingerprint, /^[a-f0-9]{10}$/u);
+  assert.match(snapshot.connectionFingerprint, /^[a-f0-9]{10}$/u);
+  assert.match(snapshot.connectionName, /^VSPiLink — .+ · [a-f0-9]{10}$/u);
+  assert.match(snapshot.connectionKey, /^vspilink-[a-z0-9-]+-[a-f0-9]{10}$/u);
   assert.equal(snapshot.hostingMode, "quick-tunnel");
   assert.equal(snapshot.unsafeFullAccess, true);
   assert.deepEqual(snapshot.fullAccessClientIds, ["pi_1111111111111111", "pi_2222222222222222"]);

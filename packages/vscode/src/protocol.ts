@@ -65,7 +65,7 @@ export const WIZARD_ACTIONS = [
 ] as const;
 
 export type WizardAction = (typeof WIZARD_ACTIONS)[number];
-export type WizardCopyField = CredentialField | "authorizationUrl" | "tokenUrl" | "mcpUrl";
+export type WizardCopyField = CredentialField | "authorizationUrl" | "tokenUrl" | "mcpUrl" | "connectionName" | "connectionDescription";
 
 interface WizardMessageBase {
   type: "wizard";
@@ -133,7 +133,7 @@ function parseWizardMessage(candidate: Record<string, unknown>): WizardWebviewMe
       if (typeof candidate.callbackUrl !== "string" || !candidate.callbackUrl.trim() || candidate.callbackUrl.length > 2_048) return undefined;
       return { ...base, action: "submitCallback", callbackUrl: candidate.callbackUrl.trim() };
     case "copyCredential":
-      if (!['clientId', 'clientSecret', 'authorizationUrl', 'tokenUrl', 'mcpUrl'].includes(String(candidate.field))) return undefined;
+      if (!['clientId', 'clientSecret', 'authorizationUrl', 'tokenUrl', 'mcpUrl', 'connectionName', 'connectionDescription'].includes(String(candidate.field))) return undefined;
       return { ...base, action: "copyCredential", field: candidate.field as WizardCopyField };
   }
 }
@@ -165,6 +165,13 @@ export interface DashboardState {
   trusted: boolean;
   workspace: string;
   configPath: string;
+  instanceId: string;
+  instanceLabel: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionDescription: string;
+  connectionKey: string;
   process: ProcessViewState;
   health: Record<string, unknown> | null;
   hostingMode: string;

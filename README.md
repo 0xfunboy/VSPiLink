@@ -3,7 +3,7 @@
 > **From chat to code, on your machine.**
 
 <p align="center">
-  <img src="docs/assets/brand/vspilink-hero.webp" width="1200" alt="VSPiLink connecting ChatGPT Work to a local VS Code workspace through OAuth and MCP">
+  <img src="docs/assets/brand/vspilink-hero.webp" width="1200" alt="VSPiLink connecting ChatGPT to a local VS Code workspace through OAuth and MCP">
 </p>
 
 VSPiLink is a self-hosted, OAuth-protected MCP bridge between ChatGPT and the
@@ -24,9 +24,8 @@ distributed by OpenAI, Microsoft, or Cloudflare.
 
 ## What it does
 
-- Connects **ChatGPT Work** to a development machine through remote MCP and
-  OAuth. Under the current official ChatGPT product model, plugins and their
-  remote MCP tools run in Work, not in normal Chat.
+- Connects normal **ChatGPT Chat** to a development machine through a personal
+  remote-MCP plugin and OAuth.
 - Keeps the default tool boundary inside the selected workspace, with explicit
   opt-ins for repository execution and unrestricted machine access.
 - Shows MCP connections, durable agent messages, shared tasks, and supervised
@@ -40,8 +39,8 @@ distributed by OpenAI, Microsoft, or Cloudflare.
 
 ```mermaid
 flowchart LR
-    User[Developer] --> Work[ChatGPT Work]
-    Work -->|OAuth + remote MCP| Public[Public HTTPS endpoint]
+    User[Developer] --> Chat[ChatGPT Chat + selected plugin]
+    Chat -->|OAuth + remote MCP| Public[Public HTTPS endpoint]
     Public -->|tunnel or reverse proxy| Core[VSPiLink on loopback]
     Core --> Harness[Pi tool harness]
     Core --> Agents[Supervised Pi agents]
@@ -58,16 +57,12 @@ models.
 
 | Mode | Model/client | Best for |
 | --- | --- | --- |
-| **ChatGPT Work + MCP** | ChatGPT Work uses VSPiLink as a plugin-backed remote MCP server | The primary remote workflow |
+| **ChatGPT Chat + MCP** | Normal Chat uses a selected server-specific VSPiLink personal plugin | The primary remote workflow |
 | **Pi Local** | A provider and model selected in VSPiLink | Direct local chat and supervised child agents |
 | **CLI/headless** | PiLink server plus optional Textual monitor | SSH, tmux, automation, and existing PiLink deployments |
 
-Normal Chat is useful for ordinary conversation, but current official ChatGPT
-documentation places plugins and remote MCP-backed tools in **Work**. Legacy
-Developer Mode/custom-connector interfaces may still appear on some accounts;
-VSPiLink keeps them as compatibility paths, not as the supported primary flow.
-Read [Usage, models, and costs](docs/USAGE_AND_COSTS.md) before choosing a
-surface or model.
+Plugin creation and availability depend on the account and workspace policy.
+Read [Usage, models, and costs](docs/USAGE_AND_COSTS.md) before choosing a model.
 
 ## Requirements
 
@@ -75,9 +70,9 @@ surface or model.
 - a VSPiLink-managed or existing **Node.js 24.18.0 exactly** on the machine
   that runs the VSPiLink sidecar;
 - a trusted local or Remote SSH workspace;
-- a public HTTPS endpoint for ChatGPT Work, normally a Cloudflare Named Tunnel
+- a public HTTPS endpoint for ChatGPT, normally a Cloudflare Named Tunnel
   or an existing reverse proxy/domain;
-- a ChatGPT plan and workspace policy that allow Work and the required plugin.
+- a ChatGPT plan and policy that allow personal plugins and remote MCP tools.
 
 Feature availability, labels, plans, credits, and limits are controlled by
 OpenAI and may change independently of VSPiLink.
@@ -129,32 +124,35 @@ For VSIX and Remote SSH instructions, see
 [Installation](docs/INSTALLATION.md). For a visual version of the complete
 first-run flow, use the sanitized [illustrated walkthrough](docs/ILLUSTRATED_GUIDE.md).
 
-## Connect ChatGPT Work
+## Connect normal ChatGPT Chat
 
 1. Open the project folder in VS Code and trust it only if you know its
    contents.
 2. Open the VSPiLink sidebar and keep **ChatGPT MCP** selected.
 3. Start the guided connection, select **Open folder** access, and configure a
    stable public HTTPS endpoint.
-4. In ChatGPT, switch to **Work**, open **Plugins**, and install or connect the
-   private VSPiLink plugin made available to your personal or workspace
-   catalog.
-5. Complete OAuth once. When Dynamic Client Registration is available, no
-   callback URL, client ID, or client secret needs to be copied manually.
-6. Start a new Work task with VSPiLink enabled and review tool approvals and
-   file changes in VS Code.
+4. The wizard opens **ChatGPT → Plugins** once in the system browser with a
+   one-use owner pairing. Click `+`, then copy the generated name, description
+   and MCP URL into a new personal plugin for that exact server. Every
+   additional machine gets a separate connection.
+5. Complete OAuth once per server connection. When Dynamic Client
+   Registration is available, no callback URL, client ID, or client secret
+   needs to be copied manually.
+6. Start a normal Chat, select that exact VSPiLink connection from Plugins,
+   and review tool approvals and file changes in VS Code. After OAuth, normal
+   Chat can return to VS Code's Integrated Browser.
 
-The downloadable release cannot embed or provision a private ChatGPT Work
-plugin ID. ChatGPT assigns that ID inside the owner's account or workspace
-after the MCP endpoint is registered. The deployment owner must therefore
-create or import the VSPiLink plugin once in Work, map it to that assigned ID,
-and make the resulting entry available through the appropriate personal or
-workspace plugin source. Other authorized users install that owner-provided
-entry; they do not create a second VSPiLink server.
+The VSPiLink package is installed once, while ChatGPT app/connection instances
+are per server. VSPiLink automatically generates a stable UUID, label,
+fingerprint, display name and non-secret descriptor for each installation.
+ChatGPT still assigns its private app ID inside the owner's account or
+workspace and requires Create/Review plus OAuth consent. The deployment owner
+creates one entry per server and shares those distinct entries through the
+appropriate personal or workspace plugin source.
 
 The optional plugin under `plugins/vspilink` is a separate **Codex-only local
 plugin** that targets VSPiLink on loopback. It does not install, replace, or
-configure the private ChatGPT Work plugin.
+configure the private ChatGPT connection.
 
 The exact plugin-sharing control depends on account and workspace policy. If
 the plugin is not available, do not install an unrelated catalog result named
@@ -223,7 +221,7 @@ Code dashboard does not.
 - [Documentation map](docs/README.md)
 - [Installation](docs/INSTALLATION.md)
 - [Illustrated setup walkthrough](docs/ILLUSTRATED_GUIDE.md)
-- [Connect ChatGPT Work](docs/CONNECT_CHATGPT.md)
+- [Connect ChatGPT](docs/CONNECT_CHATGPT.md)
 - [Usage, models, and costs](docs/USAGE_AND_COSTS.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security model](docs/SECURITY_MODEL.md)

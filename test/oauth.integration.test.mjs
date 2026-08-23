@@ -38,7 +38,12 @@ test("OAuth registration is bootstrap-protected and issued scopes are retained",
   const metadata = await (await fetch(`${serverUrl}/.well-known/oauth-authorization-server`)).json();
   assert.ok(metadata.grant_types_supported.includes("refresh_token"));
   assert.ok(metadata.scopes_supported.includes("offline_access"));
+  assert.equal(metadata.authorization_response_iss_parameter_supported, true);
   assert.equal("registration_endpoint" in metadata, false);
+  const protectedResource = await (await fetch(`${serverUrl}/.well-known/oauth-protected-resource`)).json();
+  assert.equal(protectedResource.resource, serverUrl);
+  assert.match(protectedResource.resource_name, /^VSPiLink — .+ · [a-f0-9]{10}$/u);
+  assert.equal(protectedResource.resource_documentation, `${serverUrl}/.well-known/vspilink-instance`);
 
   const healthChallenge = crypto.randomBytes(32).toString("base64url");
   const authenticatedHealth = await fetch(`${serverUrl}/health?challenge=${healthChallenge}`);
@@ -56,6 +61,13 @@ test("OAuth registration is bootstrap-protected and issued scopes are retained",
 
   const legacyHealth = await (await fetch(`${serverUrl}/health`)).json();
   assert.equal("proof" in legacyHealth, false);
+  assert.match(legacyHealth.instance.id, /^[0-9a-f-]{36}$/u);
+  assert.equal(legacyHealth.instance.connection_name, protectedResource.resource_name);
+  const descriptor = await (await fetch(`${serverUrl}/.well-known/vspilink-instance`)).json();
+  assert.equal(descriptor.schema_version, 1);
+  assert.equal(descriptor.instance_id, legacyHealth.instance.id);
+  assert.equal(descriptor.display_name, protectedResource.resource_name);
+  assert.equal(descriptor.mcp_url, `${serverUrl}/sse`);
 
   const landing = await requestWithHost(serverUrl, "/", "landing.example.test");
   assert.equal(landing.status, 200);
@@ -121,6 +133,7 @@ test("OAuth registration is bootstrap-protected and issued scopes are retained",
     state: "test-state",
     code_challenge: challenge,
     code_challenge_method: "S256",
+    resource: serverUrl,
   }).toString();
   const repeatedState = new URL(authorization);
   repeatedState.searchParams.append("state", "second-state");
@@ -132,13 +145,16 @@ test("OAuth registration is bootstrap-protected and issued scopes are retained",
     /form-action 'self' http:\/\/127\.0\.0\.1:7777(?:;|\s)/,
   );
   const consentHtml = await consentPage.text();
+  assert.match(consentHtml, /Exact VSPiLink target/);
+  assert.ok(consentHtml.includes(protectedResource.resource_name));
+  assert.ok(consentHtml.includes(serverUrl));
   const consentToken = consentHtml.match(/name="consent_token" value="([^"]+)"/)?.[1];
   assert.ok(consentToken);
   const consent = await fetch(`${serverUrl}/oauth/authorize`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     redirect: "manual",
-    body: new URLSearchParams({ action: "approve", client_id: authClient.client_id, redirect_uri: redirectUri, scope: chatGptScopes, state: "test-state", code_challenge: challenge, code_challenge_method: "S256", consent_token: consentToken }),
+    body: new URLSearchParams({ action: "approve", client_id: authClient.client_id, redirect_uri: redirectUri, scope: chatGptScopes, state: "test-state", code_challenge: challenge, code_challenge_method: "S256", consent_token: consentToken, resource: serverUrl }),
   });
   assert.equal(consent.status, 303);
   assert.match(
@@ -149,12 +165,13 @@ test("OAuth registration is bootstrap-protected and issued scopes are retained",
   assert.equal(consentLocation.origin, "http://127.0.0.1:7777");
   assert.equal(consentLocation.pathname, "/callback");
   assert.equal(consentLocation.searchParams.get("state"), "test-state");
+  assert.equal(consentLocation.searchParams.get("iss"), serverUrl);
   const authorizationCode = consentLocation.searchParams.get("code");
   assert.ok(authorizationCode);
   const pkceTokenResponse = await fetch(`${serverUrl}/oauth/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ grant_type: "authorization_code", client_id: authClient.client_id, client_secret: authClient.client_secret, redirect_uri: redirectUri, code: authorizationCode, code_verifier: verifier }),
+    body: JSON.stringify({ grant_type: "authorization_code", client_id: authClient.client_id, client_secret: authClient.client_secret, redirect_uri: redirectUri, code: authorizationCode, code_verifier: verifier, resource: serverUrl }),
   });
   assert.equal(pkceTokenResponse.status, 200);
   const pkceToken = await pkceTokenResponse.json();
@@ -387,9 +404,27 @@ test("bootstrap client registration is confined to the loopback administration b
   );
   assert.equal(publicDcrRegistration.status, 201);
   assert.equal(JSON.parse(publicDcrRegistration.body).token_endpoint_auth_method, "none");
+
+  const codexDcrRegistration = await requestWithHost(
+    localServerUrl,
+    "/oauth/register",
+    publicHostname,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Codex",
+        redirect_uris: ["http://127.0.0.1:1455/callback"],
+        grant_types: ["authorization_code", "refresh_token"],
+        scope: "mcp:tools offline_access",
+        token_endpoint_auth_method: "none",
+      }),
+    },
+  );
+  assert.equal(codexDcrRegistration.status, 401);
 });
 
-test("public ChatGPT DCR is opt-in, PKCE-only and restricted to ChatGPT callbacks", async (t) => {
+test("public OpenAI DCR is opt-in, PKCE-only and restricted to ChatGPT callbacks", async (t) => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "pilink-chatgpt-dcr-"));
   const port = await availablePort();
   const serverUrl = `http://127.0.0.1:${port}`;
@@ -438,6 +473,7 @@ test("public ChatGPT DCR is opt-in, PKCE-only and restricted to ChatGPT callback
   assert.match(client.client_id, /^pi_[a-f0-9]{16}$/u);
   assert.equal(client.token_endpoint_auth_method, "none");
   assert.deepEqual(client.grant_types, ["authorization_code", "refresh_token"]);
+  assert.deepEqual(client.response_types, ["code"]);
   assert.equal(client.scope, "mcp:tools offline_access");
   assert.equal("client_secret" in client, false);
 
@@ -449,9 +485,24 @@ test("public ChatGPT DCR is opt-in, PKCE-only and restricted to ChatGPT callback
   assert.equal(repeated.status, 201);
   assert.equal((await repeated.json()).client_id, client.client_id);
 
+  const stableRegistration = await fetch(`${serverUrl}/oauth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...registrationBody,
+      redirect_uris: ["https://chatgpt.com/connector_platform_oauth_redirect"],
+    }),
+  });
+  assert.equal(stableRegistration.status, 201);
+  assert.equal(
+    (await stableRegistration.json()).redirect_uris[0],
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+  );
+
   for (const invalidBody of [
     { ...registrationBody, redirect_uris: ["https://attacker.example/oauth/callback"] },
     { ...registrationBody, redirect_uris: ["https://chatgpt.com.evil.example/connector/oauth/test123"] },
+    { ...registrationBody, redirect_uris: ["http://127.0.0.1:1455/callback"] },
     { ...registrationBody, grant_types: ["client_credentials"] },
     { ...registrationBody, scope: "admin:all" },
   ]) {
