@@ -11,7 +11,8 @@ security model wins over convenience guidance.
 | --- | --- |
 | Install the VSIX or build from source | [Installation](INSTALLATION.md) |
 | Follow the first setup visually | [Illustrated setup walkthrough](ILLUSTRATED_GUIDE.md) |
-| Connect the supported ChatGPT surface | [Connect ChatGPT Work](CONNECT_CHATGPT.md) |
+| Configure another machine with its own Cloudflare tunnel | [MCP Tunnel Instructions for Claude Code or Codex](MCP_TUNNEL_INSTRUCTIONS_FOR_CLAUDE_CODE_OR_CODEX.md) |
+| Connect the supported ChatGPT surface | [Connect ChatGPT](CONNECT_CHATGPT.md) |
 | Understand plans, models, and consumption | [Usage, models, and costs](USAGE_AND_COSTS.md) |
 | Diagnose a failed connection | [Troubleshooting](TROUBLESHOOTING.md) |
 | Understand what crosses each boundary | [Architecture](ARCHITECTURE.md) and [Security model](SECURITY_MODEL.md) |

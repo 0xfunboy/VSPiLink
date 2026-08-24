@@ -139,6 +139,11 @@ VSPiLink is a workspace extension. In an SSH window:
    `vspilink.nodeExecutable` value to an existing exact runtime.
 5. Configure the tunnel or reverse proxy on that host.
 
+For a second computer in the same Cloudflare DNS zone, use
+[MCP Tunnel Instructions for Claude Code or Codex](MCP_TUNNEL_INSTRUCTIONS_FOR_CLAUDE_CODE_OR_CODEX.md).
+It creates a separate tunnel and server-specific MCP identity so traffic can
+never be routed silently to the wrong workspace.
+
 The Integrated Browser is rendered by the local VS Code client, while the
 sidecar, workspace, credentials, and public endpoint belong to the remote
 host. Keep that distinction in mind when diagnosing paths or network access.
@@ -151,7 +156,7 @@ host. Keep that distinction in mind when diagnosing paths or network access.
    build and test scripts may execute repository code.
 3. Open VSPiLink and select **ChatGPT MCP** for the remote workflow or
    **Pi Local** for a separately configured provider.
-4. Follow [Connect ChatGPT Work](CONNECT_CHATGPT.md) or configure Pi Local.
+4. Follow [Connect ChatGPT](CONNECT_CHATGPT.md) or configure Pi Local.
 
 Private state normally belongs outside the workspace. Do not place OAuth
 clients, refresh tokens, tunnel credentials, agent chat, task data, or audit
