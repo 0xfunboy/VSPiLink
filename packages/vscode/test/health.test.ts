@@ -180,7 +180,10 @@ test("private admin endpoints report real ChatGPT activity and create one-use pa
     observed.push({ method: request.method, path: url.pathname, authorization: request.headers.authorization });
     response.setHeader("content-type", "application/json");
     if (url.pathname === "/admin/status") {
-      response.end(JSON.stringify({ sessions: { active: 3, total: 4 }, activity: { chatgptConnected: true } }));
+      response.end(JSON.stringify({
+        sessions: { active: 7, total: 8 },
+        activity: { chatgptConnected: true, chatgptActiveSessions: 3 },
+      }));
       return;
     }
     if (url.pathname === "/admin/oauth/pairing") {

@@ -26,6 +26,23 @@ test("runtime configuration validates session limits and reclaim grace", async (
     assert.equal(defaults.publicChatGptDcr, false);
     assert.equal(defaults.dataDir, path.dirname(base.PILINK_CONFIG));
     assert.equal(defaults.coordinationDataDir, defaults.dataDir);
+    assert.match(defaults.instanceId, /^[0-9a-f-]{36}$/u);
+    assert.match(defaults.instanceFingerprint, /^[a-f0-9]{10}$/u);
+    assert.match(defaults.connectionFingerprint, /^[a-f0-9]{10}$/u);
+    assert.equal(loadRuntimeConfig(base).instanceId, defaults.instanceId, "legacy identity must be stable");
+
+    const named = loadRuntimeConfig({
+      ...base,
+      SERVER_URL: "https://mcp.example.test",
+      PI_INSTANCE_ID: "11111111-1111-4111-8111-111111111111",
+      PI_INSTANCE_LABEL: "build-server",
+    });
+    assert.equal(named.instanceId, "11111111-1111-4111-8111-111111111111");
+    assert.equal(named.instanceLabel, "build-server");
+    assert.match(named.connectionName, /^VSPiLink — build-server · [a-f0-9]{10}$/u);
+    assert.match(named.connectionKey, /^vspilink-build-server-[a-f0-9]{10}$/u);
+    assert.throws(() => loadRuntimeConfig({ ...base, PI_INSTANCE_ID: "shared-server" }), /canonical UUID/);
+    assert.throws(() => loadRuntimeConfig({ ...base, PI_INSTANCE_LABEL: "bad/label" }), /safe display/);
 
     const oauthDataDir = path.join(workspace, "oauth-data");
     const coordinationDataDir = path.join(path.dirname(workspace), "coordination-data");

@@ -1,15 +1,14 @@
-# Connect ChatGPT Work
+# Connect normal ChatGPT Chat
 
-This is the canonical connection guide. Current official OpenAI documentation
-places plugins and their remote MCP-backed tools in **ChatGPT Work** on the web.
-Normal Chat does not currently expose those plugin tools. VSPiLink cannot
-change an OpenAI product entitlement or workspace policy.
+This is the canonical connection guide. VSPiLink uses a personal ChatGPT
+plugin backed by one remote MCP endpoint. Each machine gets its own distinct
+connection; normal Chat uses it after you select it from the Plugins menu.
 
 The supported flow is:
 
 ```text
-ChatGPT Work -> installed/private plugin -> OAuth -> VSPiLink MCP endpoint
-             -> Pi tool harness -> selected VS Code workspace
+Normal Chat -> selected personal plugin -> OAuth -> VSPiLink MCP endpoint
+            -> Pi tool harness -> selected VS Code workspace
 ```
 
 ## Before you begin
@@ -20,13 +19,11 @@ Confirm all four layers:
 2. The selected workspace is trusted and the sidecar is healthy on loopback.
 3. The public VSPiLink origin is stable, HTTPS, and reachable from the
    Internet.
-4. Your ChatGPT plan and workspace policy allow ChatGPT Work and the VSPiLink
-   plugin or personal/workspace plugin source.
+4. Your ChatGPT plan and policy allow personal plugins and remote MCP tools.
 
-OpenAI documents plugin use on the web as: switch to **Work**, then open
-**Plugins**. The public directory, personal marketplace, workspace marketplace,
-and creation controls visible to you depend on product rollout and administrator
-policy. VSPiLink is not an unrelated public catalog result that can be found by
+OpenAI documents creation as **Plugins → + → name/description → endpoint →
+Create**, followed by review and OAuth. The controls visible to you depend on
+product rollout and policy. VSPiLink is not an unrelated public result found by
 searching for "MCP server".
 
 ## 1. Prepare the local bridge
@@ -50,29 +47,42 @@ OAuth discovery checks to validate it.
 
 ## 2. Make VSPiLink available as a plugin
 
-This is the one owner-only provisioning step that a generic VSPiLink release
-cannot perform. ChatGPT creates a private `plugin_asdk_app...` identifier in
-the owner's account or workspace only after that owner registers the MCP
-server connection. A release cannot safely embed, predict, or provision that
-per-account identifier.
+VSPiLink uses one distributable package and one separate app/connection
+instance for every server. Do not download, rename, or fork the package for
+each VPS. The installation generates a stable instance ID and a connection
+name such as `VSPiLink — build-vps · a1b2c3d4e5`; that exact name is bound to
+one server installation and MCP origin. The currently selected workspace is
+shown separately and may be changed deliberately on that server.
 
-The deployment owner must create or import VSPiLink once in **Work**, map the
-plugin manifest to the identifier ChatGPT assigned, and publish or share it
-through the personal or workspace plugin source permitted by policy. Other
-authorized users then install that owner-provided entry. They do not search
-the public catalog and do not create another local bridge.
+ChatGPT creates a private `plugin_asdk_app...` identifier in the owner's
+account or workspace only after that owner registers the MCP connection.
+VSPiLink cannot bypass ChatGPT's Create/Review step or OAuth consent. It
+automates the server identity, endpoint, OAuth discovery, DCR and copyable
+values so the owner never has to invent identifiers.
+
+Create one owner-provided app entry **per VSPiLink server**, then share each
+entry through the personal or workspace plugin source permitted by policy.
+Other authorized users install the entry for the server they intend to use.
+Never repoint an existing entry to a different VPS or local machine.
 
 In ChatGPT web:
 
-1. Switch the surface selector from **Chat** to **Work**.
-2. Open **Plugins** in the left sidebar.
-3. Open the VSPiLink plugin supplied through your personal or workspace plugin
-   source, then install it.
-4. If you are the plugin owner, use the personal/workspace creation or import
-   controls exposed to your account to configure the remote VSPiLink MCP
-   endpoint. Those controls are not available to every member.
-5. If no personal/workspace VSPiLink entry or creation control exists, stop and
-   ask the workspace administrator or plugin publisher to make it available.
+1. In the VSPiLink sidebar, select **Open setup in browser**. VSPiLink opens
+   the system browser with a one-use owner pairing already applied. This setup
+   handoff is required because VS Code's integrated browser blocks the OAuth
+   popup used by ChatGPT; normal Chat returns inside VS Code after approval.
+2. Copy the generated **Connection name** and MCP URL.
+   Automation may read the same non-secret values from
+   `https://YOUR-MCP-HOST/.well-known/vspilink-instance`.
+3. Open **Plugins**, select the personal tab, and click `+`.
+4. Create a **new** connection using the exact generated name, description and
+   endpoint, then select OAuth/DCR.
+5. Review that the displayed name, endpoint and fingerprint match the intended
+   machine, then approve OAuth.
+6. Repeat only step 4 once for every additional VSPiLink server. Do not edit the
+   first server's app to point at the second server.
+7. If no personal/workspace creation control exists, ask the workspace
+   administrator or plugin publisher to create the server-specific entry.
 
 Do not install Workable, Alpic, or another public result merely because its
 description contains "MCP". It will connect to that vendor's server, not your
@@ -80,13 +90,30 @@ VSPiLink instance.
 
 The repository directory `plugins/vspilink` is an optional **Codex local
 plugin** whose MCP URL is loopback-only. It is intentionally separate from the
-private ChatGPT Work plugin and cannot provision or substitute for the
+private ChatGPT plugin and cannot provision or substitute for the
 owner-specific ChatGPT identifier above.
+
+### Multiple-server invariant
+
+```text
+one VSPiLink configuration + one instance ID + one HTTPS origin
+= one named ChatGPT app/connection + one DCR client
+```
+
+The package may be installed on any number of machines, but connection
+instances are never shared between origins. OAuth access tokens are already
+audience-bound to the exact `SERVER_URL`; the generated name and fingerprint
+make the same boundary visible to people and models. A central router that
+silently chooses a machine from a tool argument is intentionally unsupported.
+
+Codex MCP configuration is a separate optional integration and is not used by
+the normal-Chat workflow described here.
 
 Official references:
 
-- [Plugins](https://learn.chatgpt.com/docs/plugins)
-- [MCP in ChatGPT and Codex](https://learn.chatgpt.com/docs/extend/mcp)
+- [Connect a plugin to ChatGPT](https://developers.openai.com/plugins/deploy/connect-chatgpt)
+- [Plugin architecture](https://developers.openai.com/plugins/concepts/plugins)
+- [OAuth, PKCE and Dynamic Client Registration](https://developers.openai.com/plugins/build/auth)
 - [Build an MCP-backed plugin](https://developers.openai.com/plugins/build/mcp-server)
 
 ## 3. Complete OAuth
@@ -107,6 +134,10 @@ Use DCR when the plugin builder offers it:
 5. On the VSPiLink consent page, verify the client name, endpoint, workspace,
    and requested scopes.
 6. Select **Approve** once and wait for the redirect back to ChatGPT.
+
+The system browser is used only for this setup/consent step. The wizard watches
+for the issued token and opens normal Chat in VS Code's integrated browser as
+soon as the connection succeeds.
 
 DCR registers the callback and client automatically. Do **not** search for a
 callback/fallback URL, invent a client ID, or paste a secret when DCR succeeds.
@@ -130,18 +161,18 @@ Never paste the client secret into ChatGPT conversation text, a repository,
 issue, screenshot, or log. If the builder does not expose these controls, the
 manual fallback is not available on that surface.
 
-### Legacy Developer Mode
+### Developer Mode visibility
 
-Older ChatGPT interfaces exposed a Developer Mode/custom-connector workflow.
-VSPiLink retains compatibility with that flow when the account still shows it,
-but it is not the current primary documentation path. Labels, locations, and
-availability may differ or disappear. Do not weaken DCR, OAuth, or callback
-validation to compensate for a missing legacy control.
+If the personal Plugins page does not show `+`, open Security and login and
+check whether Developer Mode is available for the account. Labels and
+availability may differ. Do not weaken DCR, OAuth, or callback validation to
+compensate for a missing account-level control.
 
 ## 4. Run the first task
 
-1. Start a new **Work** task.
-2. Enable or invoke the installed VSPiLink plugin.
+1. Start a new normal **Chat**.
+2. From `+ → Plugins`, select the exact VSPiLink name and fingerprint for the
+   intended machine.
 3. Begin with a bounded read-only request, for example:
 
    ```text
@@ -177,15 +208,14 @@ Quick Tunnel is different: its hostname changes, so the previous plugin
 connection points to an obsolete origin. Create a new connection for the new
 origin or migrate to a Named Tunnel/existing domain.
 
-## Normal Chat, Work, and Codex
+## ChatGPT and Codex
 
 | Surface | VSPiLink use |
 | --- | --- |
-| Normal Chat | Conversation only; current official plugin/MCP tools are not available there |
-| ChatGPT Work | Supported web workflow for installed plugins and remote MCP tools |
-| Codex desktop/CLI/IDE | Can connect to MCP through Codex's own MCP configuration; this is separate from the ChatGPT Work plugin connection |
+| Normal Chat | Primary workflow: select the server-specific personal VSPiLink plugin |
+| ChatGPT Work | Separate surface; use only if your account deliberately requires it |
+| Codex desktop/CLI/IDE | Optional separate MCP configuration; not part of this ChatGPT connection |
 | Pi Local | Uses a provider configured in VSPiLink and separate credentials/usage |
 
-Work and Codex share OpenAI usage/credits under current official pricing. A Pro
-plan can increase included usage, but it does not make VSPiLink MCP available
-inside normal Chat. See [Usage, models, and costs](USAGE_AND_COSTS.md).
+Plans, usage and plugin availability are controlled by OpenAI and may change.
+See [Usage, models, and costs](USAGE_AND_COSTS.md).

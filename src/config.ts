@@ -3,6 +3,13 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  createInstanceId,
+  defaultInstanceLabel,
+  legacyInstanceId,
+  resolveInstanceIdentity,
+  type InstanceIdentity,
+} from "./instance-identity.js";
 
 export const VERSION = "2.2.0";
 
@@ -10,6 +17,14 @@ export interface RuntimeConfig {
   port: number;
   host: string;
   serverUrl: string;
+  instanceId: string;
+  instanceLabel: string;
+  instanceSlug: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionDescription: string;
+  connectionKey: string;
   landingHostname?: string;
   workspace: string;
   dataDir: string;
@@ -62,8 +77,38 @@ export function defaultCoordinationDataDir(
 export function loadEnvironment(): void {
   const inheritedEnvironment = { ...process.env };
   dotenv.config();
-  dotenv.config({ path: process.env.PILINK_CONFIG || defaultConfigPath(), override: true });
+  const activeConfigPath = process.env.PILINK_CONFIG || defaultConfigPath();
+  dotenv.config({ path: activeConfigPath, override: true });
+  const persistedLegacyId = persistLegacyInstanceIdentity(activeConfigPath);
+  if (persistedLegacyId && inheritedEnvironment.PI_INSTANCE_ID === undefined) {
+    process.env.PI_INSTANCE_ID = persistedLegacyId;
+  }
   Object.assign(process.env, inheritedEnvironment);
+}
+
+/**
+ * Upgrade an existing pre-identity installation without changing its identity.
+ * The deterministic UUID is derived from the already-private JWT secret and
+ * written once with the same private-file guarantees as the rest of config.
+ */
+export function persistLegacyInstanceIdentity(activeConfigPath: string): string | undefined {
+  if (!fs.existsSync(activeConfigPath)) return undefined;
+  const stat = fs.lstatSync(activeConfigPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("PILINK_CONFIG must be a regular private file");
+  const contents = fs.readFileSync(activeConfigPath, "utf8");
+  const values = dotenv.parse(contents);
+  if (values.PI_INSTANCE_ID || !values.JWT_SECRET) return values.PI_INSTANCE_ID;
+  const instanceId = legacyInstanceId(values.JWT_SECRET);
+  const lines = contents.split(/\r?\n/u);
+  if (lines.length && lines.at(-1) !== "") lines.push("");
+  lines.push(`PI_INSTANCE_ID=${instanceId}`);
+  const updated = `${lines.join("\n").replace(/\n+$/u, "")}\n`;
+  const directory = path.dirname(activeConfigPath);
+  const temporary = path.join(directory, `.${path.basename(activeConfigPath)}.${process.pid}.identity.tmp`);
+  fs.writeFileSync(temporary, updated, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  fs.renameSync(temporary, activeConfigPath);
+  if (process.platform !== "win32") fs.chmodSync(activeConfigPath, 0o600);
+  return instanceId;
 }
 
 export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -121,21 +166,22 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
   const serverUrl = env.SERVER_URL || `http://${host === "0.0.0.0" ? "localhost" : host}:${port}`;
   const landingHostname = optionalHostname(env.PI_LANDING_HOSTNAME, "PI_LANDING_HOSTNAME");
 
-  try {
-    const url = new URL(serverUrl);
-    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error();
-  } catch {
-    throw new Error("SERVER_URL must be an absolute http(s) URL");
-  }
-
   const activeConfigPath = env.PILINK_CONFIG || defaultConfigPath();
   const dataDir = path.resolve(env.PI_DATA_DIR || path.dirname(activeConfigPath));
   const fullAccessClientIds = parseFullAccessClientIds(env.PI_FULL_ACCESS_CLIENT_IDS);
+  const identity = resolveInstanceIdentity({
+    instanceId: env.PI_INSTANCE_ID,
+    instanceLabel: env.PI_INSTANCE_LABEL,
+    publicUrl: serverUrl,
+    legacyJwtSecret: jwtSecret,
+    fallbackSeed: activeConfigPath,
+  });
 
   return {
     port,
     host,
-    serverUrl: serverUrl.replace(/\/$/, ""),
+    serverUrl: identity.publicOrigin,
+    ...identity,
     ...(landingHostname ? { landingHostname } : {}),
     workspace,
     dataDir,
@@ -166,6 +212,9 @@ export function loadRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runtime
     maxConcurrentAgents,
   };
 }
+
+export { createInstanceId, defaultInstanceLabel, resolveInstanceIdentity };
+export type { InstanceIdentity };
 
 export function parseFullAccessClientIds(value: string | undefined): readonly string[] {
   if (!value?.trim()) return Object.freeze([]);

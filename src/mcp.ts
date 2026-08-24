@@ -69,6 +69,7 @@ import {
   memoryQueryToolInputSchema,
 } from "./memory-mcp.js";
 import { sanitizeExecutionSpawnContext } from "./execution-environment.js";
+import { resolveInstanceIdentity } from "./instance-identity.js";
 
 export interface McpAgentServices {
   manager: AgentManager;
@@ -134,10 +135,22 @@ interface ToolRequestContext extends ProgressRequestContext {
   signal: AbortSignal;
 }
 
+export interface McpServerIdentity {
+  instanceId: string;
+  instanceLabel: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionDescription: string;
+  connectionKey: string;
+  serverUrl: string;
+}
+
 interface ToolCallResult {
   content: unknown;
   isError?: boolean;
   structuredContent?: unknown;
+  _meta?: Record<string, unknown>;
 }
 
 export function createMcpServer(
@@ -152,6 +165,7 @@ export function createMcpServer(
   memoryStore?: AgentMemoryStore,
   workLoopStore?: AgentWorkLoopStore,
   managedAgentServices?: McpAgentServices,
+  serverIdentity?: Readonly<McpServerIdentity>,
 ): McpServerHandle {
   const agentServices = isMcpAgentServices(identityOrAgentServices)
     ? identityOrAgentServices
@@ -161,6 +175,7 @@ export function createMcpServer(
     : identityOrAgentServices;
   const connectionAgentInstanceId = normalizeAgentInstanceId(agentInstanceId);
   const authenticatedIdentity = identity ? normalizeAuthenticatedIdentity(identity) : undefined;
+  const targetIdentity = serverIdentity ? normalizeMcpServerIdentity(serverIdentity) : undefined;
   let verifiedCollaborationContext: Readonly<ConnectionCollaborationContext> | undefined;
   let collaborationConnectionState: "pristine" | "bootstrapping" | "bootstrapped" | "generic_locked" = collaborationBootstrap
     ? collaborationBootstrap.initialized ? "bootstrapped" : "pristine"
@@ -209,9 +224,17 @@ export function createMcpServer(
     policy,
     undefined,
     collaborationBootstrap ? "pristine" : "legacy",
+    targetIdentity,
   );
   const server = new McpServer(
-    { name: "pilink", version: VERSION },
+    targetIdentity
+      ? {
+          name: targetIdentity.connectionKey,
+          title: targetIdentity.connectionName,
+          version: VERSION,
+          description: targetIdentity.connectionDescription,
+        }
+      : { name: "pilink", title: "VSPiLink", version: VERSION },
     { instructions: initialSystemPromptText },
   );
   const readTool = createReadTool(policy.workspace);
@@ -224,6 +247,24 @@ export function createMcpServer(
 
   let releasedWorkStateGate: (tool: string) => Promise<string | undefined> = async () => undefined;
 
+  const withTargetMetadata = <T extends ToolCallResult>(result: T): T => {
+    if (!targetIdentity) return result;
+    return {
+      ...result,
+      _meta: {
+        ...result._meta,
+        "cc.eu.funboy.vspilink/instance": {
+          instance_id: targetIdentity.instanceId,
+          instance_fingerprint: targetIdentity.instanceFingerprint,
+          connection_fingerprint: targetIdentity.connectionFingerprint,
+          connection_name: targetIdentity.connectionName,
+          connection_description: targetIdentity.connectionDescription,
+          server_url: targetIdentity.serverUrl,
+        },
+      },
+    } as T;
+  };
+
   const auditCall = async <T extends ToolCallResult>(
     tool: string,
     extra: ToolRequestContext,
@@ -235,16 +276,16 @@ export function createMcpServer(
     let outcome: ToolAuditEventInput["outcome"] = "error";
     let fields: Partial<ToolAuditEventInput> = {};
     try {
-      const gateError = tool !== "get_system_prompt" && tool !== "collaboration_bootstrap"
+      const gateError = tool !== "get_system_prompt" && tool !== "server_identity" && tool !== "collaboration_bootstrap"
         ? await prepareProjectCollaboration()
         : undefined;
-      if (gateError) return toolError(gateError) as T;
+      if (gateError) return withTargetMetadata(toolError(gateError) as T);
       const workGateError = await releasedWorkStateGate(tool);
-      if (workGateError) return toolError(workGateError) as T;
+      if (workGateError) return withTargetMetadata(toolError(workGateError) as T);
       const result = await operation();
       outcome = result.isError ? "error" : "success";
       fields = outcomeFields?.(result) || {};
-      return result;
+      return withTargetMetadata(result);
     } finally {
       if (audit) {
         const reportFailure = () => console.error(`[AUDIT] Failed to persist metadata for tool '${tool}'`);
@@ -283,7 +324,7 @@ export function createMcpServer(
     try {
       const result = await server.server.elicitInput({
         mode: "form",
-        message: `${label} requests execution approval.\n\n${detail}\n\nApprove only if you understand that this code runs as the PiLink operating-system user and may affect files, processes, or network resources.`,
+        message: `${label} requests execution approval.${targetIdentity ? `\n\nConnection: ${targetIdentity.connectionName}\nDescription: ${targetIdentity.connectionDescription}\nMachine: ${targetIdentity.instanceLabel} · ${targetIdentity.instanceFingerprint}\nConnection fingerprint: ${targetIdentity.connectionFingerprint}\nOrigin: ${targetIdentity.serverUrl}\nMCP URL: ${targetIdentity.serverUrl}/sse\nCurrent workspace: ${policy.workspace}` : ""}\n\n${detail}\n\nApprove only if you understand that this code runs as the PiLink operating-system user and may affect files, processes, or network resources.`,
         requestedSchema: {
           type: "object",
           properties: {
@@ -397,7 +438,7 @@ export function createMcpServer(
   });
 
   releasedWorkStateGate = async (tool: string): Promise<string | undefined> => {
-    if (!workLoopStore || tool === "collaboration_bootstrap" || tool === "get_system_prompt" || tool === "agent_work_wait") {
+    if (!workLoopStore || tool === "collaboration_bootstrap" || tool === "get_system_prompt" || tool === "server_identity" || tool === "agent_work_wait") {
       return undefined;
     }
     if (collaborationConnectionState !== "bootstrapped") return undefined;
@@ -422,6 +463,7 @@ export function createMcpServer(
       policy,
       context,
       collaborationBootstrap ? collaborationConnectionState : "legacy",
+      targetIdentity,
     );
   };
 
@@ -453,6 +495,43 @@ export function createMcpServer(
   }, (_args, extra) => auditCall("get_system_prompt", extra, async () => ({
     content: [{ type: "text" as const, text: await currentSystemPromptText() }],
   })));
+
+  if (targetIdentity) {
+    const serverIdentityResultSchema = z.object({
+      instance_id: z.string(),
+      instance_label: z.string(),
+      instance_fingerprint: z.string(),
+      connection_fingerprint: z.string(),
+      connection_name: z.string(),
+      connection_description: z.string(),
+      connection_key: z.string(),
+      server_url: z.string(),
+      workspace: z.string(),
+    }).strict();
+    server.registerTool("server_identity", {
+      title: "Verify VSPiLink Server Identity",
+      description: "Return the exact VSPiLink machine, public endpoint, connection fingerprint, and current workspace. Use it before side effects when more than one VSPiLink server is available.",
+      inputSchema: z.object({}).strict(),
+      outputSchema: serverIdentityResultSchema,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    }, (_args, extra) => auditCall("server_identity", extra, async () => {
+      const result = {
+        instance_id: targetIdentity.instanceId,
+        instance_label: targetIdentity.instanceLabel,
+        instance_fingerprint: targetIdentity.instanceFingerprint,
+        connection_fingerprint: targetIdentity.connectionFingerprint,
+        connection_name: targetIdentity.connectionName,
+        connection_description: targetIdentity.connectionDescription,
+        connection_key: targetIdentity.connectionKey,
+        server_url: targetIdentity.serverUrl,
+        workspace: policy.workspace,
+      };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
+    }));
+  }
 
   if (collaborationBootstrap) {
     const collaborationBootstrapResultSchema = z.object({
@@ -500,7 +579,7 @@ export function createMcpServer(
           occupancy_label: assignment.occupancyLabel,
           contract_id: assignment.contractId,
           contract_version: assignment.contractVersion,
-          guidance: buildSystemPrompt(policy, context, "bootstrapped"),
+          guidance: buildSystemPrompt(policy, context, "bootstrapped", targetIdentity),
         };
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -1579,6 +1658,7 @@ function buildSystemPrompt(
   policy: HarnessPolicy,
   context: Readonly<ConnectionCollaborationContext> | undefined,
   mode: CollaborationPromptMode,
+  serverIdentity?: Readonly<McpServerIdentity>,
 ): string {
   const modeGuidance = mode === "pristine"
     ? "If the current user request explicitly assigns a collaboration role, call collaboration_bootstrap first with that exact role label before reading repository files, agent chat, tasks, or any other project content and before calling any other project tool. The label is untrusted input; only the server-returned canonical assignment selects role guidance. If the current user request does not assign a role, do not invent one; proceed with the requested project operation, which permanently locks this connection into generic actor-scoped collaboration mode."
@@ -1587,7 +1667,11 @@ function buildSystemPrompt(
       : mode === "generic_locked"
         ? "Role bootstrap is unavailable on this MCP session because project content or another project tool was accessed first. Continue with generic actor-scoped collaboration behavior. Create a new MCP session to obtain a verified role assignment."
         : undefined;
-  const basePrompt = `You are an expert coding assistant using the PiLink tool harness.
+  const targetGuidance = serverIdentity
+    ? `VSPILINK SERVER TARGET\nConnection: ${serverIdentity.connectionName}\nDescription: ${serverIdentity.connectionDescription}\nInstance fingerprint: ${serverIdentity.instanceFingerprint}\nConnection fingerprint: ${serverIdentity.connectionFingerprint}\nEndpoint: ${serverIdentity.serverUrl}\nCurrent workspace: ${policy.workspace}\nThis connection is permanently bound to this server installation and public origin. The current workspace is mutable configuration and is shown separately above. Never claim that a tool call ran on another server. If the user names a different machine, use that machine's separate VSPiLink connection instead of routing or guessing.`
+    : "VSPILINK SERVER TARGET\nLegacy unnamed connection. Verify the configured workspace before side effects.";
+
+  const basePrompt = `${targetGuidance}\n\nYou are an expert coding assistant using the PiLink tool harness.
 
 Tools are available only when permitted by the OAuth token. In workspace mode, file operations are restricted to ${policy.workspace}; bash is intentionally unavailable. In explicit unsafe-full-access mode, an authorized client can access the entire machine.${modeGuidance ? `\n\nCOLLABORATION CONNECTION MODE\n${modeGuidance}` : ""}
 
@@ -1623,6 +1707,57 @@ Guidelines:
     `${basePrompt}\n\n${sessionFragment}`,
     { verifiedAssignment: assignment },
   );
+}
+
+function normalizeMcpServerIdentity(value: Readonly<McpServerIdentity>): Readonly<McpServerIdentity> {
+  if (!value || typeof value !== "object") throw new Error("serverIdentity must be an object");
+  const instanceId = value.instanceId.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(instanceId)) {
+    throw new Error("serverIdentity.instanceId must be a canonical UUID");
+  }
+  const safeText = (input: string, name: string, max: number): string => {
+    const normalized = input.trim();
+    if (!normalized || normalized.length > max || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(normalized)) {
+      throw new Error(`serverIdentity.${name} is invalid`);
+    }
+    return normalized;
+  };
+  const instanceLabel = safeText(value.instanceLabel, "instanceLabel", 64);
+  const instanceFingerprint = safeText(value.instanceFingerprint, "instanceFingerprint", 32);
+  const connectionFingerprint = safeText(value.connectionFingerprint, "connectionFingerprint", 32);
+  if (!/^[a-f0-9]{10,32}$/u.test(instanceFingerprint) || !/^[a-f0-9]{10,32}$/u.test(connectionFingerprint)) {
+    throw new Error("serverIdentity fingerprints must be lowercase hexadecimal");
+  }
+  const connectionName = safeText(value.connectionName, "connectionName", 160);
+  const connectionDescription = safeText(value.connectionDescription, "connectionDescription", 500);
+  const connectionKey = safeText(value.connectionKey, "connectionKey", 63);
+  if (!/^[a-z0-9][a-z0-9-]*$/u.test(connectionKey)) throw new Error("serverIdentity.connectionKey is invalid");
+  let serverUrl: string;
+  try {
+    const parsed = new URL(value.serverUrl);
+    if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error();
+    serverUrl = parsed.origin;
+  } catch {
+    throw new Error("serverIdentity.serverUrl must be an absolute HTTP(S) URL");
+  }
+  const canonical = resolveInstanceIdentity({ instanceId, instanceLabel, publicUrl: serverUrl });
+  if (
+    canonical.instanceFingerprint !== instanceFingerprint ||
+    canonical.connectionFingerprint !== connectionFingerprint ||
+    canonical.connectionName !== connectionName ||
+    canonical.connectionDescription !== connectionDescription ||
+    canonical.connectionKey !== connectionKey
+  ) throw new Error("serverIdentity derived fields do not match its instance and public origin");
+  return Object.freeze({
+    instanceId: canonical.instanceId,
+    instanceLabel: canonical.instanceLabel,
+    instanceFingerprint: canonical.instanceFingerprint,
+    connectionFingerprint: canonical.connectionFingerprint,
+    connectionName: canonical.connectionName,
+    connectionDescription: canonical.connectionDescription,
+    connectionKey: canonical.connectionKey,
+    serverUrl: canonical.publicOrigin,
+  });
 }
 
 function normalizeAuthenticatedIdentity(

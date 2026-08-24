@@ -23,6 +23,7 @@ export interface WizardRuntimeResult {
 export interface ResumableWizardRuntime extends WizardRuntimeResult {
   workspace: string;
   hosting?: HostingSelection;
+  accessMode?: WizardAccessMode;
   chatGptConnected?: boolean;
 }
 
@@ -85,8 +86,10 @@ export class WizardController {
     return this.enqueue(async () => {
       const normalized = validateResumableRuntime(runtime);
       const sameConfiguration = this.state.configPath === normalized.configPath;
-      const sameRuntime = sameConfiguration && this.state.publicUrl === normalized.publicUrl;
-      const credential = sameConfiguration ? this.state.credential : undefined;
+      const sameRuntime = sameConfiguration &&
+        this.state.publicUrl === normalized.publicUrl &&
+        this.state.mcpUrl === normalized.mcpUrl;
+      const credential = sameRuntime ? this.state.credential : undefined;
       const appliedHosting = normalized.hosting || (sameRuntime ? this.state.appliedHosting || this.state.hosting : undefined);
       await this.commit(revise(this.state, {
         seen: true,
@@ -94,12 +97,13 @@ export class WizardController {
         completed: normalized.chatGptConnected,
         phase: normalized.chatGptConnected ? "complete" : credential ? "credentials" : "callback",
         workspace: normalized.workspace,
+        accessMode: normalized.accessMode || (sameRuntime ? this.state.accessMode : "workspace"),
         configPath: normalized.configPath,
         publicUrl: normalized.publicUrl,
         mcpUrl: normalized.mcpUrl,
         chatGptConnected: normalized.chatGptConnected,
         chatGptPageOpened: false,
-        developerModeConfirmed: normalized.chatGptConnected || (sameConfiguration && this.state.developerModeConfirmed === true),
+        developerModeConfirmed: normalized.chatGptConnected || (sameRuntime && this.state.developerModeConfirmed === true),
         hosting: appliedHosting,
         appliedHosting,
         appliedConfigPath: normalized.configPath,
@@ -113,19 +117,41 @@ export class WizardController {
   /** Persist a securely discovered runtime without opening onboarding. */
   adoptRuntime(runtime: ResumableWizardRuntime): Promise<void> {
     return this.enqueue(async () => {
+      const reportedConnectionState = runtime.chatGptConnected;
       const normalized = validateResumableRuntime(runtime);
-      const sameRuntime = this.state.configPath === normalized.configPath && this.state.publicUrl === normalized.publicUrl;
+      const sameRuntime = this.state.configPath === normalized.configPath &&
+        this.state.publicUrl === normalized.publicUrl &&
+        this.state.mcpUrl === normalized.mcpUrl;
       const appliedHosting = normalized.hosting || (sameRuntime ? this.state.appliedHosting || this.state.hosting : undefined);
+      const targetState = normalized.chatGptConnected
+        ? {
+            chatGptConnected: true,
+            developerModeConfirmed: true,
+            completed: true,
+            phase: "complete" as const,
+          }
+        : (!sameRuntime || reportedConnectionState === false)
+          ? {
+              chatGptConnected: false,
+              developerModeConfirmed: false,
+              chatGptPageOpened: false,
+              credential: undefined,
+              callbackUrl: undefined,
+              completed: false,
+              phase: this.state.active ? "callback" as const : "idle" as const,
+            }
+          : {};
       await this.commit(revise(this.state, {
         seen: true,
         workspace: normalized.workspace,
+        accessMode: normalized.accessMode || (sameRuntime ? this.state.accessMode : "workspace"),
         configPath: normalized.configPath,
         publicUrl: normalized.publicUrl,
         mcpUrl: normalized.mcpUrl,
         hosting: appliedHosting,
         appliedHosting,
         appliedConfigPath: normalized.configPath,
-        ...(normalized.chatGptConnected ? { chatGptConnected: true, developerModeConfirmed: true } : {}),
+        ...targetState,
         error: undefined,
       }));
     });
@@ -139,6 +165,21 @@ export class WizardController {
         developerModeConfirmed: true,
         phase: "complete",
         completed: true,
+        error: undefined,
+      }));
+    });
+  }
+
+  forgetChatGptConnection(): Promise<void> {
+    return this.enqueue(async () => {
+      await this.commit(revise(this.state, {
+        chatGptConnected: false,
+        chatGptPageOpened: false,
+        developerModeConfirmed: false,
+        credential: undefined,
+        callbackUrl: undefined,
+        completed: false,
+        phase: this.state.publicUrl ? "callback" : "idle",
         error: undefined,
       }));
     });

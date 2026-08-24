@@ -258,11 +258,13 @@ test("resuming an existing public runtime does not open a client automatically",
     publicUrl: "https://mcp.example.test/",
     mcpUrl: "https://mcp.example.test/sse",
     hosting: { kind: "custom-domain", publicUrl: "https://mcp.example.test" },
+    accessMode: "full",
   });
 
   assert.equal(controller.viewState.active, true);
   assert.equal(controller.viewState.phase, "callback");
   assert.equal(controller.viewState.mcpUrl, "https://mcp.example.test/sse");
+  assert.equal(controller.viewState.accessMode, "full");
   assert.deepEqual(events, []);
 });
 
@@ -326,6 +328,79 @@ test("persistent OAuth recovery completes a callback-phase wizard even when Secr
   assert.equal(controller.viewState.chatGptConnected, true);
 });
 
+test("an origin change clears every target-bound OAuth and wizard state", async () => {
+  const controller = new WizardController(new WizardStateStore(new MemoryMemento()), {
+    selectWorkspace: async () => undefined,
+    selectCloudflareCredential: async () => undefined,
+    confirmFullAccess: async () => false,
+    provision: async () => { throw new Error("unused"); },
+    start: async () => { throw new Error("unused"); },
+    pairOwner: async () => false,
+    openChatGpt: async () => undefined,
+    copyText: async () => undefined,
+    registerChatGpt: async (callbackUrl) => ({
+      clientId: "pi_0123456789abcdef",
+      clientName: "Old origin",
+      redirectUris: [callbackUrl],
+      grantTypes: ["authorization_code", "refresh_token"],
+      scope: "mcp:tools offline_access",
+      tokenEndpointAuthMethod: "client_secret_post",
+      createdAt: "2026-08-03T00:00:00.000Z",
+      hasSecret: true,
+    }),
+    credentialValue: async () => undefined,
+    onDidChange: () => undefined,
+  });
+
+  await controller.resumeRuntime({
+    workspace: "/workspace-a",
+    configPath: "/private/.env",
+    publicUrl: "https://mcp-a.example.test",
+    mcpUrl: "https://mcp-a.example.test/sse",
+  });
+  await controller.handle({
+    type: "wizard",
+    action: "submitCallback",
+    requestId: "origin-a",
+    callbackUrl: "https://chatgpt.com/connector/oauth/OriginA123",
+  });
+  await controller.noteChatGptConnected();
+  assert.equal(controller.viewState.credential?.clientId, "pi_0123456789abcdef");
+
+  await controller.adoptRuntime({
+    workspace: "/workspace-b",
+    configPath: "/private/.env",
+    publicUrl: "https://mcp-b.example.test",
+    mcpUrl: "https://mcp-b.example.test/sse",
+    chatGptConnected: false,
+  });
+  assert.equal(controller.viewState.credential, undefined);
+  assert.equal(controller.viewState.callbackUrl, undefined);
+  assert.equal(controller.viewState.chatGptConnected, false);
+  assert.equal(controller.viewState.developerModeConfirmed, false);
+  assert.equal(controller.viewState.completed, false);
+  assert.equal(controller.viewState.phase, "callback");
+  assert.equal(controller.viewState.accessMode, "workspace", "a different origin must not inherit a pending Full access intent");
+
+  await controller.handle({
+    type: "wizard",
+    action: "submitCallback",
+    requestId: "origin-b",
+    callbackUrl: "https://chatgpt.com/connector/oauth/OriginB123",
+  });
+  await controller.noteChatGptConnected();
+  await controller.resumeRuntime({
+    workspace: "/workspace-c",
+    configPath: "/private/.env",
+    publicUrl: "https://mcp-c.example.test",
+    mcpUrl: "https://mcp-c.example.test/sse",
+    chatGptConnected: false,
+  });
+  assert.equal(controller.viewState.credential, undefined);
+  assert.equal(controller.viewState.chatGptConnected, false);
+  assert.equal(controller.viewState.phase, "callback");
+});
+
 test("runtime adoption repairs durable hosting state without opening or activating onboarding", async () => {
   let browserCalls = 0;
   const controller = new WizardController(new WizardStateStore(new MemoryMemento()), {
@@ -348,6 +423,7 @@ test("runtime adoption repairs durable hosting state without opening or activati
     configPath: "/private/.env",
     publicUrl: "https://mcp.example.test",
     mcpUrl: "https://mcp.example.test/sse",
+    accessMode: "full",
     hosting: {
       kind: "cloudflare-named",
       tunnelName: "vspilink-example",
@@ -362,6 +438,7 @@ test("runtime adoption repairs durable hosting state without opening or activati
 
   assert.equal(controller.viewState.active, false);
   assert.equal(controller.viewState.phase, "idle");
+  assert.equal(controller.viewState.accessMode, "full");
   assert.equal(controller.currentState.appliedHosting?.credentialReference, reference);
   assert.equal(JSON.stringify(controller.viewState).includes(reference), false);
   assert.equal(browserCalls, 0);

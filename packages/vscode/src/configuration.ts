@@ -2,7 +2,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  createInstanceId,
+  defaultInstanceLabel,
+  legacyInstanceId,
+  normalizePublicOrigin,
+  resolveInstanceIdentity,
+  type InstanceIdentity,
+} from "../../../src/instance-identity.js";
 import type { HostingSelection } from "./hosting-model.js";
+import { assertPrivateStateBoundary } from "./private-state-boundary.js";
 import type { PublicClientSummary } from "./protocol.js";
 
 export interface ConfigSnapshot {
@@ -17,6 +26,14 @@ export interface ConfigSnapshot {
   unsafeFullAccess: boolean;
   fullAccessClientIds: string[];
   serverUrl: string;
+  instanceId: string;
+  instanceLabel: string;
+  instanceSlug: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionDescription: string;
+  connectionKey: string;
   bootstrapSecret?: string;
   clients: PublicClientSummary[];
 }
@@ -134,6 +151,8 @@ export function provisionWizardConfiguration(options: {
       `PI_WORK_DIR=${serializeEnvValue(workspace)}`,
       `PI_DATA_DIR=${serializeEnvValue(path.dirname(options.configPath))}`,
       `PI_COORDINATION_DATA_DIR=${serializeEnvValue(defaultCoordinationDataDir(options.configPath))}`,
+      `PI_INSTANCE_ID=${createInstanceId()}`,
+      `PI_INSTANCE_LABEL=${defaultInstanceLabel()}`,
       `PORT=${port}`,
       `JWT_SECRET=${privateSecret()}`,
       `PI_BOOTSTRAP_SECRET=${privateSecret()}`,
@@ -159,7 +178,16 @@ export function provisionWizardConfiguration(options: {
     ].join("\n");
   }
   contents = updateEnvValue(contents, "PI_WORK_DIR", workspace);
-  if (!parseEnv(contents).PI_COORDINATION_DATA_DIR) {
+  const existingValues = parseEnv(contents);
+  if (!existingValues.PI_INSTANCE_ID) {
+    contents = updateEnvValue(
+      contents,
+      "PI_INSTANCE_ID",
+      existingValues.JWT_SECRET ? legacyInstanceId(existingValues.JWT_SECRET) : createInstanceId(),
+    );
+  }
+  if (!existingValues.PI_INSTANCE_LABEL) contents = updateEnvValue(contents, "PI_INSTANCE_LABEL", defaultInstanceLabel());
+  if (!existingValues.PI_COORDINATION_DATA_DIR) {
     contents = updateEnvValue(contents, "PI_COORDINATION_DATA_DIR", defaultCoordinationDataDir(options.configPath));
   }
   contents = updateEnvValue(contents, "PI_UNSAFE_FULL_ACCESS", "false");
@@ -205,7 +233,24 @@ export function provisionWizardConfiguration(options: {
       contents = removeEnvValue(contents, "PI_LANDING_HOSTNAME");
       break;
   }
+  const finalValues = parseEnv(contents);
+  assertPrivateStateBoundary({
+    capabilityRoot: workspace,
+    configPath: path.resolve(options.configPath),
+    dataDir: path.resolve(finalValues.PI_DATA_DIR || path.dirname(options.configPath)),
+    coordinationDir: path.resolve(
+      finalValues.PI_COORDINATION_DATA_DIR ||
+      defaultCoordinationDataDir(options.configPath),
+    ),
+  });
   writePrivateFile(options.configPath, contents.endsWith("\n") ? contents : `${contents}\n`);
+}
+
+/** Persist the effective edge origin once a transient host is known. */
+export function persistEffectivePublicOrigin(configPath: string, publicUrl: string): void {
+  if (!fs.existsSync(configPath)) throw new Error("VSPiLink must be provisioned before its public origin is persisted.");
+  const contents = updateEnvValue(fs.readFileSync(configPath, "utf8"), "SERVER_URL", normalizePublicOrigin(publicUrl));
+  writePrivateFile(configPath, contents.endsWith("\n") ? contents : `${contents}\n`);
 }
 
 export function readConfigSnapshot(configPath: string, fallbackWorkspace: string): ConfigSnapshot {
@@ -226,6 +271,7 @@ export function readConfigSnapshot(configPath: string, fallbackWorkspace: string
   const host = values.HOST || "127.0.0.1";
   const localHost = host === "0.0.0.0" ? "127.0.0.1" : host;
   const serverUrl = (values.SERVER_URL || `http://${localHost}:${port}`).replace(/\/$/, "");
+  const identity = resolveConfigInstanceIdentity(values, serverUrl, configPath);
   return {
     configPath,
     configured,
@@ -237,16 +283,33 @@ export function readConfigSnapshot(configPath: string, fallbackWorkspace: string
     hostingMode: values.PI_HOSTING_MODE || "not configured",
     unsafeFullAccess: values.PI_UNSAFE_FULL_ACCESS === "true",
     fullAccessClientIds: parseFullAccessClientIds(values.PI_FULL_ACCESS_CLIENT_IDS),
-    serverUrl,
+    serverUrl: identity.publicOrigin,
+    ...identity,
     bootstrapSecret: values.PI_BOOTSTRAP_SECRET,
-    clients: readClients(dataDir),
+    clients: readClients(dataDir, identity),
   };
+}
+
+function resolveConfigInstanceIdentity(
+  values: Readonly<Record<string, string>>,
+  serverUrl: string,
+  configPath: string,
+): ReturnType<typeof resolveInstanceIdentity> {
+  return resolveInstanceIdentity({
+    instanceId: values.PI_INSTANCE_ID,
+    instanceLabel: values.PI_INSTANCE_LABEL,
+    publicUrl: serverUrl,
+    legacyJwtSecret: values.JWT_SECRET,
+    fallbackSeed: path.resolve(configPath),
+  });
 }
 
 const RUNTIME_ENVIRONMENT_KEYS = [
   "PI_WORK_DIR",
   "PI_DATA_DIR",
   "PI_COORDINATION_DATA_DIR",
+  "PI_INSTANCE_ID",
+  "PI_INSTANCE_LABEL",
   "PORT",
   "HOST",
   "SERVER_URL",
@@ -288,13 +351,14 @@ export function localServerUrl(snapshot: Pick<ConfigSnapshot, "port">): string {
   return `http://127.0.0.1:${snapshot.port}`;
 }
 
-function readClients(dataDir: string): PublicClientSummary[] {
+function readClients(dataDir: string, identity: Readonly<InstanceIdentity>): PublicClientSummary[] {
   const filePath = path.join(dataDir, "clients.json");
   if (!fs.existsSync(filePath)) return [];
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as { clients?: unknown[] };
     if (!Array.isArray(parsed.clients)) return [];
-    const authorizations = readActiveRefreshAuthorizations(dataDir);
+    const legacyBindingIsCurrent = readLegacyOAuthBindingStatus(dataDir, identity);
+    const authorizations = readActiveRefreshAuthorizations(dataDir, identity, legacyBindingIsCurrent);
     return parsed.clients.flatMap((value) => {
       if (!value || typeof value !== "object") return [];
       const client = value as Record<string, unknown>;
@@ -311,6 +375,10 @@ function readClients(dataDir: string): PublicClientSummary[] {
       const tokenVersion = Number.isSafeInteger(client.token_version) && (client.token_version as number) > 0
         ? client.token_version as number
         : 1;
+      const expectedKind = client.token_endpoint_auth_method === "none" ? "public" : "confidential";
+      const bindingIsCurrent = client.binding === undefined
+        ? legacyBindingIsCurrent
+        : oauthBindingMatches(client.binding, identity, expectedKind);
       return [{
         id: client.client_id,
         name: client.client_name,
@@ -318,7 +386,8 @@ function readClients(dataDir: string): PublicClientSummary[] {
         scope: typeof client.scope === "string" ? client.scope : "",
         createdAt: typeof client.created_at === "string" ? client.created_at : "",
         chatGpt: grantTypes.includes("authorization_code") && redirectUris.some(isChatGptRedirectUri),
-        authorized: authorizations.has(`${client.client_id}:${tokenVersion}`),
+        authorized: bindingIsCurrent && authorizations.has(`${client.client_id}:${tokenVersion}`),
+        stale: !bindingIsCurrent,
       }];
     });
   } catch {
@@ -331,7 +400,12 @@ function readClients(dataDir: string): PublicClientSummary[] {
  * that was merely registered from one that completed OAuth. Token hashes are
  * never returned or copied into dashboard state.
  */
-function readActiveRefreshAuthorizations(dataDir: string, now = Date.now()): Set<string> {
+function readActiveRefreshAuthorizations(
+  dataDir: string,
+  identity: Readonly<InstanceIdentity>,
+  legacyBindingIsCurrent: boolean,
+  now = Date.now(),
+): Set<string> {
   const result = new Set<string>();
   const filePath = path.join(dataDir, "refresh-tokens.json");
   if (!fs.existsSync(filePath)) return result;
@@ -346,6 +420,10 @@ function readActiveRefreshAuthorizations(dataDir: string, now = Date.now()): Set
         typeof token.token_hash !== "string" || !/^[a-f0-9]{64}$/u.test(token.token_hash) ||
         typeof token.expires_at !== "number" || !Number.isSafeInteger(token.expires_at) || token.expires_at <= now
       ) continue;
+      const bindingIsCurrent = token.binding === undefined
+        ? legacyBindingIsCurrent
+        : oauthBindingMatches(token.binding, identity);
+      if (!bindingIsCurrent) continue;
       const version = Number.isSafeInteger(token.client_version) && (token.client_version as number) > 0
         ? token.client_version as number
         : 1;
@@ -355,6 +433,39 @@ function readActiveRefreshAuthorizations(dataDir: string, now = Date.now()): Set
     // A malformed private store must fail closed and never expose its content.
   }
   return result;
+}
+
+function readLegacyOAuthBindingStatus(dataDir: string, identity: Readonly<InstanceIdentity>): boolean {
+  const filePath = path.join(dataDir, "oauth-instance-binding.json");
+  if (!fs.existsSync(filePath)) return false;
+  try {
+    const stat = fs.lstatSync(filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > 64 * 1024) return false;
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, unknown>;
+    return parsed.metadata_version === 1 &&
+      parsed.instance_id === identity.instanceId &&
+      parsed.instance_fingerprint === identity.instanceFingerprint &&
+      oauthBindingMatches(parsed.legacy_binding_target, identity);
+  } catch {
+    return false;
+  }
+}
+
+function oauthBindingMatches(
+  value: unknown,
+  identity: Readonly<InstanceIdentity>,
+  clientKind?: "public" | "confidential",
+): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const binding = value as Record<string, unknown>;
+  return binding.binding_version === 1 &&
+    binding.instance_id === identity.instanceId &&
+    binding.instance_fingerprint === identity.instanceFingerprint &&
+    binding.public_origin === identity.publicOrigin &&
+    binding.connection_key === identity.connectionKey &&
+    binding.connection_fingerprint === identity.connectionFingerprint &&
+    binding.resource === identity.publicOrigin &&
+    (clientKind === undefined || binding.client_kind === clientKind);
 }
 
 function isChatGptRedirectUri(value: string): boolean {

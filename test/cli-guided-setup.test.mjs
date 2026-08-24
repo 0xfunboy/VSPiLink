@@ -123,7 +123,9 @@ test("first start guides callback registration and persists a ChatGPT OAuth clie
   assert.match(output, /=== Cloudflare Quick Tunnel started ===/);
   assert.match(output, /Use this MCP server URL in ChatGPT: https:\/\/cli-test\.trycloudflare\.com\/sse/);
   assert.match(output, /Settings → Apps\/Connectors \(or your MCP connections page\) → Add connection/);
-  assert.match(output, /Set the connection\/MCP server URL to: https:\/\/cli-test\.trycloudflare\.com\/sse/);
+  assert.match(output, /Create a NEW connection named exactly: VSPiLink — .+ · [a-f0-9]{10}/);
+  assert.match(output, /Set its MCP server URL to: https:\/\/cli-test\.trycloudflare\.com\/sse/);
+  assert.match(output, /Never reuse or edit a VSPiLink connection that points to another server/);
   assert.doesNotMatch(output, /Developer mode|Workspace settings|Enterprise|Business|Edu|Apps → Create/i);
   assert.ok(bannerIndex !== -1, "Server banner box should be printed");
   assert.ok(promptIndex !== -1, "Paste callback URL prompt should be printed");

@@ -10,6 +10,9 @@ export const WEBVIEW_COMMANDS = [
   "manageTrust",
   "connectChatGpt",
   "openChatGpt",
+  "reconnectChatGpt",
+  "revokeChatGpt",
+  "cancelChatGptSetup",
   "setupChat",
   "sendChat",
   "cancelChat",
@@ -65,7 +68,7 @@ export const WIZARD_ACTIONS = [
 ] as const;
 
 export type WizardAction = (typeof WIZARD_ACTIONS)[number];
-export type WizardCopyField = CredentialField | "authorizationUrl" | "tokenUrl" | "mcpUrl";
+export type WizardCopyField = CredentialField | "authorizationUrl" | "tokenUrl" | "mcpUrl" | "connectionName" | "connectionDescription";
 
 interface WizardMessageBase {
   type: "wizard";
@@ -133,7 +136,7 @@ function parseWizardMessage(candidate: Record<string, unknown>): WizardWebviewMe
       if (typeof candidate.callbackUrl !== "string" || !candidate.callbackUrl.trim() || candidate.callbackUrl.length > 2_048) return undefined;
       return { ...base, action: "submitCallback", callbackUrl: candidate.callbackUrl.trim() };
     case "copyCredential":
-      if (!['clientId', 'clientSecret', 'authorizationUrl', 'tokenUrl', 'mcpUrl'].includes(String(candidate.field))) return undefined;
+      if (!['clientId', 'clientSecret', 'authorizationUrl', 'tokenUrl', 'mcpUrl', 'connectionName', 'connectionDescription'].includes(String(candidate.field))) return undefined;
       return { ...base, action: "copyCredential", field: candidate.field as WizardCopyField };
   }
 }
@@ -158,6 +161,8 @@ export interface PublicClientSummary {
   chatGpt: boolean;
   /** True when a non-expired refresh token proves OAuth completed. */
   authorized: boolean;
+  /** True when this persisted client belongs to a previous public origin. */
+  stale: boolean;
 }
 
 export interface DashboardState {
@@ -165,6 +170,13 @@ export interface DashboardState {
   trusted: boolean;
   workspace: string;
   configPath: string;
+  instanceId: string;
+  instanceLabel: string;
+  instanceFingerprint: string;
+  connectionFingerprint: string;
+  connectionName: string;
+  connectionDescription: string;
+  connectionKey: string;
   process: ProcessViewState;
   health: Record<string, unknown> | null;
   hostingMode: string;
@@ -192,6 +204,8 @@ export interface DashboardState {
     active: boolean;
     /** Backwards-compatible aggregate: authorized or active. */
     connected: boolean;
+    /** Persisted ChatGPT clients deliberately rejected for another origin. */
+    staleConnections: number;
     activeSessions: number;
   };
   collaboration: {

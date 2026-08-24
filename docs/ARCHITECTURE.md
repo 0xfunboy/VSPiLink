@@ -121,6 +121,14 @@ flowchart LR
     Session --> Tasks
 ```
 
+Each VSPiLink configuration also owns a stable, non-secret server instance ID.
+The public origin plus that ID derives the visible connection fingerprint.
+One distributable plugin package may serve many installations, but every
+machine/origin is exposed as a separately named app or MCP connection. The
+server advertises the identity in MCP initialization, protected-resource
+metadata, consent, tool-result metadata, and `/.well-known/vspilink-instance`.
+No tool parameter or relay silently selects a different machine.
+
 One OAuth client represents one durable remote identity. Multiple concurrent
 MCP connections can share that identity but receive distinct server-minted
 instance IDs. Collaboration roles and sessions are verified server-side;

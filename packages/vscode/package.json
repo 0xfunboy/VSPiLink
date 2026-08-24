@@ -34,7 +34,8 @@
   "main": "./dist/extension.cjs",
   "activationEvents": [
     "onStartupFinished",
-    "onView:vspilink.sidebarSecondaryView"
+    "onView:vspilink.sidebarSecondaryView",
+    "onUri"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -69,9 +70,24 @@
       },
       {
         "command": "vspilink.openChatGpt",
-        "title": "Open ChatGPT Work",
+        "title": "Open ChatGPT Chat",
         "category": "VSPiLink",
         "icon": "$(globe)"
+      },
+      {
+        "command": "vspilink.reconnectChatGpt",
+        "title": "Reconnect ChatGPT OAuth",
+        "category": "VSPiLink"
+      },
+      {
+        "command": "vspilink.revokeChatGpt",
+        "title": "Revoke ChatGPT OAuth",
+        "category": "VSPiLink"
+      },
+      {
+        "command": "vspilink.cancelChatGptSetup",
+        "title": "Cancel Pending ChatGPT Setup",
+        "category": "VSPiLink"
       },
       {
         "command": "vspilink.initialize",

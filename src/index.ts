@@ -39,6 +39,16 @@ loadEnvironment();
 const config = loadRuntimeConfig();
 const policy = createHarnessPolicy(config);
 const { port: PORT, host: HOST, serverUrl: SERVER_URL } = config;
+const MCP_SERVER_IDENTITY = Object.freeze({
+  instanceId: config.instanceId,
+  instanceLabel: config.instanceLabel,
+  instanceFingerprint: config.instanceFingerprint,
+  connectionFingerprint: config.connectionFingerprint,
+  connectionName: config.connectionName,
+  connectionDescription: config.connectionDescription,
+  connectionKey: config.connectionKey,
+  serverUrl: config.serverUrl,
+});
 
 type AgentRuntimeState = "disabled" | "ready" | "degraded" | "unavailable";
 type CoordinationUnavailableReason = "unsafe_data_location" | "initialization_failed";
@@ -229,7 +239,7 @@ app.use((req, res, next) => {
 });
 
 // ── Mount OAuth routes (public, no Bearer required) ──────────
-const oauthRouter = createOAuthRouter();
+const oauthRouter = createOAuthRouter({ onClientDeleted: closeClientTransports });
 app.use(["/oauth/token", "/oauth/register", "/oauth/authorize", "/oauth/pair", "/admin/oauth/pairing", "/admin/oauth/clients"], createRateLimiter(20, 60_000));
 app.use(oauthRouter);
 app.use(["/admin/status", "/admin/agents", "/admin/collaboration"], createRateLimiter(120, 60_000));
@@ -249,11 +259,41 @@ app.get("/health", (req, res) => {
     server: "pilink",
     version: VERSION,
     harness: "pi-agent",
+    instance: {
+      id: config.instanceId,
+      label: config.instanceLabel,
+      fingerprint: config.instanceFingerprint,
+      connection_fingerprint: config.connectionFingerprint,
+      connection_name: config.connectionName,
+      connection_description: config.connectionDescription,
+    },
     // Keep the legacy health payload for existing browser-mode installs, while
     // new paired installs expose operational counters only on /admin/status.
     ...(config.oauthConsentMode === "browser" ? { sessions: publicSessionStatus() } : {}),
     timestamp: new Date().toISOString(),
     ...authenticated,
+  });
+});
+
+// Public, non-secret descriptor for installers and clients that need one
+// deterministic MCP entry per VSPiLink server.
+app.get("/.well-known/vspilink-instance", (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    schema_version: 1,
+    instance_id: config.instanceId,
+    instance_label: config.instanceLabel,
+    instance_fingerprint: config.instanceFingerprint,
+    connection_fingerprint: config.connectionFingerprint,
+    display_name: config.connectionName,
+    description: config.connectionDescription,
+    connection_key: config.connectionKey,
+    server_url: SERVER_URL,
+    mcp_url: `${SERVER_URL}/sse`,
+    oauth: {
+      protected_resource_metadata: `${SERVER_URL}/.well-known/oauth-protected-resource`,
+      authorization_server_metadata: `${SERVER_URL}/.well-known/oauth-authorization-server`,
+    },
   });
 });
 
@@ -265,6 +305,15 @@ app.get("/admin/status", requireLocalAdmin, (_req, res) => {
     server: "pilink",
     version: VERSION,
     server_url: SERVER_URL,
+    instance: {
+      id: config.instanceId,
+      label: config.instanceLabel,
+      fingerprint: config.instanceFingerprint,
+      connection_fingerprint: config.connectionFingerprint,
+      connection_name: config.connectionName,
+      connection_description: config.connectionDescription,
+      connection_key: config.connectionKey,
+    },
     sessions: publicSessionStatus(),
     agents: publicAgentRuntimeStatus(),
     activity: serviceActivitySnapshot(),
@@ -718,12 +767,26 @@ function createConnectionMcpServer(
       canRead ? getAgentMemoryStore() : undefined,
       bootstrap ? getAgentWorkLoopStore() : undefined,
       mcpAgentServices(clientId, connectionPolicy),
+      MCP_SERVER_IDENTITY,
     );
   } catch {
     // A deliberately unsafe or unavailable private data directory must not
     // disable the supervised runtime or the basic workspace harness.
     console.error("[COLLABORATION] Durable upstream services are unavailable; continuing with the supervised runtime only.");
-    return createMcpServer(connectionPolicy, scopes, mcpAgentServices(clientId, connectionPolicy));
+    return createMcpServer(
+      connectionPolicy,
+      scopes,
+      mcpAgentServices(clientId, connectionPolicy),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      MCP_SERVER_IDENTITY,
+    );
   }
 }
 
@@ -765,6 +828,21 @@ function once(callback: () => void): () => void {
 
 function activeSessionsForClient(clientId: string): number {
   return Object.values(transports).filter((managed) => managed.clientId === clientId).length;
+}
+
+function isChatGptOAuthClient(clientId: string): boolean {
+  const client = findClient(clientId);
+  if (!client || !client.grant_types.includes("authorization_code")) return false;
+  return client.redirect_uris.some((value) => {
+    try {
+      const url = new URL(value);
+      const hostname = url.hostname.toLowerCase();
+      return url.protocol === "https:" && !url.username && !url.password && !url.hash &&
+        (hostname === "chatgpt.com" || hostname === "www.chatgpt.com" || hostname === "chat.openai.com");
+    } catch {
+      return false;
+    }
+  });
 }
 
 function publicSessionStatus() {
@@ -1079,7 +1157,11 @@ function removeManagedTransport(
   const managed = transports[sessionId];
   if (!managed || (expected && managed.transport !== expected)) return undefined;
   delete transports[sessionId];
-  setActiveMcpSessions(managed.clientId, activeSessionsForClient(managed.clientId));
+  setActiveMcpSessions(
+    managed.clientId,
+    activeSessionsForClient(managed.clientId),
+    isChatGptOAuthClient(managed.clientId),
+  );
   return managed;
 }
 
@@ -1096,6 +1178,16 @@ async function closeManagedTransport(sessionId: string, managed: ManagedTranspor
   const detached = removeManagedTransport(sessionId, managed.transport);
   if (!detached) return;
   await closeDetachedTransport(sessionId, detached, context);
+}
+
+async function closeClientTransports(clientId: string): Promise<void> {
+  const owned = Object.entries(transports).filter(([, managed]) => managed.clientId === clientId);
+  await Promise.all(owned.map(([sessionId, managed]) => closeManagedTransport(
+    sessionId,
+    managed,
+    "OAuth revoke",
+  )));
+  setActiveMcpSessions(clientId, 0, isChatGptOAuthClient(clientId));
 }
 
 function isReclaimable(managed: ManagedTransport, now: number): boolean {
@@ -1265,7 +1357,7 @@ app.post("/sse", authenticateBearer, asyncRoute(async (req, res) => {
         console.error("[MCP] Streamable HTTP session created.");
         if (managed) {
           transports[sid] = managed;
-          setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub));
+          setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub), isChatGptOAuthClient(client.sub));
           releaseReservation();
         }
       },
@@ -1302,7 +1394,7 @@ app.post("/sse", authenticateBearer, asyncRoute(async (req, res) => {
     try {
       await mcpServer.connect(transport);
       await withManagedRequest(managed, () => transport.handleRequest(req, res, req.body));
-      recordMcpInitialized(client.sub);
+      recordMcpInitialized(client.sub, isChatGptOAuthClient(client.sub));
       notifyParentOfMcpConnection();
     } catch (error) {
       cleanup();
@@ -1385,7 +1477,7 @@ app.get("/sse", authenticateBearer, asyncRoute(async (req, res) => {
   );
   managed.openStreams = 1;
   transports[transport.sessionId] = managed;
-  setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub));
+  setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub), isChatGptOAuthClient(client.sub));
   releaseReservation();
   console.error("[MCP] Legacy SSE session created.");
 
@@ -1462,7 +1554,7 @@ app.post("/messages", authenticateBearer, asyncRoute(async (req, res) => {
   try {
     await withManagedRequest(managed, () => transport.handlePostMessage(req, res, req.body));
     managed.established = true;
-    recordMcpInitialized(managed.clientId);
+    recordMcpInitialized(managed.clientId, isChatGptOAuthClient(managed.clientId));
     notifyParentOfMcpConnection();
   } catch (error) {
     console.error("[MCP] Error handling legacy SSE message:", error);
@@ -1496,6 +1588,8 @@ const server = app.listen(PORT, HOST, () => {
 ║    Register: ${(SERVER_URL + "/oauth/register").padEnd(35)}║
 ╚══════════════════════════════════════════════════╝
   `);
+  console.error(`[INSTANCE] ${config.connectionName}`);
+  console.error(`[INSTANCE] MCP endpoint: ${SERVER_URL}/sse`);
 });
 server.once("error", (error: NodeJS.ErrnoException) => {
   if (error.code === "EADDRINUSE") {
@@ -1536,7 +1630,7 @@ function renderLandingPage(): string {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>VSPiLink · Local-first MCP bridge</title>
+  <title>${config.connectionName} · MCP bridge</title>
   <style>
     :root { color-scheme: dark; --bg:#090a0d; --panel:#121419; --line:#272b33; --text:#f4f6f8; --muted:#9aa3ad; --accent:#77e0c1; --accent2:#8ea8ff; }
     * { box-sizing:border-box; }
@@ -1549,6 +1643,7 @@ function renderLandingPage(): string {
     .dot { width:7px; height:7px; border-radius:50%; background:var(--accent); box-shadow:0 0 16px #77e0c1; }
     .hero { max-width:780px; margin-bottom:56px; }
     .eyebrow { margin:0 0 15px; color:var(--accent); font:700 12px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.12em; text-transform:uppercase; }
+    .identity { display:inline-flex; margin:0 0 22px; padding:8px 11px; border:1px solid #78e2c342; border-radius:9px; background:#50d5ae0d; color:#b9f6e3; font:650 13px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace; }
     h1 { margin:0; max-width:760px; font-size:clamp(42px,7vw,76px); line-height:.99; letter-spacing:-.055em; font-weight:760; }
     h1 span { color:transparent; background:linear-gradient(105deg,var(--accent),var(--accent2)); background-clip:text; -webkit-background-clip:text; }
     .lead { max-width:690px; margin:25px 0 0; color:#bbc2ca; font-size:clamp(17px,2.2vw,21px); line-height:1.55; }
@@ -1574,10 +1669,12 @@ function renderLandingPage(): string {
     </header>
     <section class="hero">
       <p class="eyebrow">Local-first agent infrastructure</p>
+      <p class="identity">${config.connectionName}</p>
       <h1>Your workspace, connected <span>on your terms.</span></h1>
       <p class="lead">A secure bridge from ChatGPT to the Pi coding-tool harness in your local workspace, with explicit OAuth consent and collaborative agent monitoring.</p>
       <div class="actions">
         <a class="button primary" href="https://github.com/0xfunboy/VSPiLink" rel="noreferrer">View source on GitHub</a>
+        <a class="button" href="/.well-known/vspilink-instance">Connection descriptor</a>
         <a class="button" href="https://github.com/0xfunboy/VSPiLink#readme" rel="noreferrer">Read documentation</a>
       </div>
     </section>
@@ -1586,7 +1683,7 @@ function renderLandingPage(): string {
       <article class="card"><span class="num">02</span><h2>Secure by default</h2><p>Loopback origin, PKCE, rotating refresh tokens, paired owner consent and workspace-scoped tools.</p></article>
       <article class="card"><span class="num">03</span><h2>Collaborative monitor</h2><p>Watch remote ChatGPT conversations, durable agent chat and the shared task board beside the files they change.</p></article>
     </section>
-    <footer><span>VSPiLink ${VERSION} · Streamable HTTP + legacy SSE</span><span>Independent open-source project · Not affiliated with OpenAI</span></footer>
+    <footer><span>VSPiLink ${VERSION} · ${config.connectionFingerprint} · Streamable HTTP + legacy SSE</span><span>Independent open-source project · Not affiliated with OpenAI</span></footer>
   </main>
 </body>
 </html>`;

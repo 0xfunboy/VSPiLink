@@ -1,13 +1,13 @@
 # VSPiLink for VS Code
 
-VSPiLink connects ChatGPT Work to the Pi workspace tool harness through an
+VSPiLink connects normal ChatGPT Chat to the Pi workspace tool harness through a
 OAuth-protected MCP server:
 
 ```text
-ChatGPT Work -> VSPiLink plugin -> HTTPS OAuth/MCP -> VSPiLink -> selected folder
+ChatGPT Chat -> selected VSPiLink plugin -> HTTPS OAuth/MCP -> selected folder
 ```
 
-ChatGPT Work remains the agent surface and coordinator. Its selected model uses
+ChatGPT remains the agent surface and coordinator. Its selected model uses
 VSPiLink's file, Git,
 bounded execution, collaboration, and supervised-agent tools, while its VS
 Code view reports connection status and deliberately published activity. The
@@ -44,11 +44,10 @@ After installation:
 For manual VSIX, Remote SSH, source-build, and upgrade instructions, read the
 [complete installation guide](https://github.com/0xfunboy/VSPiLink/blob/master/docs/INSTALLATION.md).
 
-## Connect ChatGPT Work
+## Connect normal ChatGPT Chat
 
-Current ChatGPT web support exposes remote MCP-backed tools through installed
-plugins in **ChatGPT Work**. Normal Chat does not currently support plugins,
-including on a Pro plan.
+VSPiLink uses a personal remote-MCP plugin in normal Chat. Create one distinct
+plugin connection for every VPS or local machine.
 
 1. Open and trust the specific project folder VSPiLink should access.
 2. Keep **ChatGPT MCP** selected in VSPiLink.
@@ -58,33 +57,35 @@ including on a Pro plan.
    after reviewing its remote-code-execution warning.
 5. Configure a stable public HTTPS endpoint and wait for the local service and
    public endpoint to become healthy.
-6. Open ChatGPT Work, open **Plugins**, and install the private VSPiLink plugin
-   supplied by your personal or workspace plugin source. VSPiLink is not a
-   public catalog result named "MCP server."
+6. Let the wizard open **ChatGPT → Plugins** once in the system browser with a
+   one-use owner pairing. Click `+` and copy the exact generated name,
+   description, and endpoint into a new personal plugin. Do not reuse another
+   machine's entry.
 7. Complete OAuth once. Prefer **Dynamic Client Registration (DCR)** when it is
    available; DCR does not require you to copy a callback URL, client ID, or
    client secret.
-8. Start a bounded read-only Work task, verify the reported workspace, and
-   authorize writes only when the scope is correct.
+8. Start a bounded read-only Chat, select the exact server-specific VSPiLink
+   plugin, verify the workspace, and authorize writes only when it is correct.
+   After OAuth, normal Chat can return to VS Code's Integrated Browser.
 
-The VSIX cannot embed or provision a private, per-account ChatGPT Work plugin
+The VSIX cannot silently provision a private, per-account ChatGPT plugin
 ID. ChatGPT assigns that ID only after the deployment owner registers the MCP
 endpoint inside their account or workspace. The owner must create or import
-the VSPiLink plugin once in Work, map it to that assigned ID, and make the
+the VSPiLink plugin once per server, map it to that assigned ID, and make the
 resulting entry available through the permitted personal or workspace plugin
 source. Other authorized users install that owner-provided entry.
 
 The plugin source and the VS Code extension are separate installation layers.
-If your VSPiLink plugin is not visible in ChatGPT Work, ask its publisher or
+If your VSPiLink plugin is not visible in ChatGPT, ask its publisher or
 workspace administrator to make it available. Do not install an unrelated
 public plugin.
 
 The optional repository bundle at `plugins/vspilink` is a separate Codex-only
 loopback plugin for local development. It does not install, replace, or
-configure the private ChatGPT Work plugin.
+configure the private ChatGPT plugin.
 
 See the canonical
-[ChatGPT Work connection guide](https://github.com/0xfunboy/VSPiLink/blob/master/docs/CONNECT_CHATGPT.md)
+[ChatGPT connection guide](https://github.com/0xfunboy/VSPiLink/blob/master/docs/CONNECT_CHATGPT.md)
 for DCR, the manual OAuth compatibility fallback, and troubleshooting.
 
 ## What appears in the VS Code view
@@ -94,7 +95,7 @@ messages deliberately posted through `agent_chat_post`, shared tasks, and
 supervised Pi agents. It does not mirror the ChatGPT conversation. An empty
 collaboration feed is normal until an agent publishes a message or task.
 
-Write task instructions in ChatGPT Work. The VSPiLink monitor is not a second
+Write task instructions in normal Chat with the intended connection selected. The VSPiLink monitor is not a second
 remote prompt box.
 
 ## Fixed `run` profiles

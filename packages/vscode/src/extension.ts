@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,17 +5,26 @@ import * as vscode from "vscode";
 import { AgentAuthSidecar, type AgentAuthCatalog, type AgentAuthEvent, type AgentAuthPrompt, type AgentProviderCatalogEntry } from "./agent-auth.js";
 import { agentOAuthMethodChoices, hasConfiguredAgentAuth, inspectAdminAgentRuntime, stableDashboardHealth } from "./chat-runtime.js";
 import { chatGptNavigation, type ChatGptDestination } from "./chatgpt-links.js";
-import { readConfigSnapshot, resolveConfigPath, localServerUrl, provisionWizardConfiguration, removeEnvValue, updateEnvValue, writePrivateFile, type ConfigSnapshot } from "./configuration.js";
+import { MANAGED_CLOUDFLARED_VERSION, provisionManagedCloudflared } from "./cloudflared-bootstrap.js";
+import { readConfigSnapshot, resolveConfigPath, localServerUrl, persistEffectivePublicOrigin, provisionWizardConfiguration, removeEnvValue, updateEnvValue, writePrivateFile, type ConfigSnapshot } from "./configuration.js";
+import { loginCloudflare } from "./cloudflare-login.js";
 import { CloudflareCredentialVault, type CloudflareCredentialSummary } from "./credential-vault.js";
 import { DashboardProvider } from "./dashboard.js";
 import { effectiveProcessState } from "./dashboard-model.js";
+import { attestEndpoint } from "./endpoint-attestation.js";
+import { selectPendingFullAccessClient } from "./full-access-binding.js";
 import { cancelAdminAgentTurn, createOwnerPairing, isLoopbackPortOccupied, readAdminAgentOutput, readAdminAgents, readAdminCollaboration, readAdminStatus, readHealth, sendAdminAgentMessage, spawnAdminAgent, stopAdminAgent, waitForAdminRuntime, waitForHealth, waitForPublicHealth } from "./health.js";
 import { hostingStartPlan, normalizeHostingSelection, normalizeMcpEndpointOrigin, type CloudflareAuthKind, type HostingSelection } from "./hosting-model.js";
+import { ensureUserLinger, inspectUserLinger } from "./linger.js";
 import { inspectManagedNamedHosting, readManagedUnitRuntimeState, restartManagedServerUnit, validateManagedServerUnit } from "./named-hosting-recovery.js";
 import { OAuthClientService, isMcpScope, type McpScope } from "./oauth-client.js";
+import { OAuthHandoffIntentStore, type OAuthHandoffIdentity } from "./oauth-handoff-intent.js";
+import { provisionManagedNodeRuntime } from "./node-bootstrap.js";
+import { assertPrivateCredentialOutsideCapabilityRoot } from "./private-state-boundary.js";
+import { resolveQuickTunnelRuntimeIdentity } from "./quick-tunnel-identity.js";
 import { resolveSidecarNodeRuntime, type SidecarNodeRuntime } from "./node-runtime.js";
 import { ProcessSupervisor, resolveCliPath, runJsonCli } from "./process-supervisor.js";
-import type { DashboardState, WebviewCommand, WebviewCommandMessage, WizardCopyField } from "./protocol.js";
+import type { DashboardState, PublicClientSummary, WebviewCommand, WebviewCommandMessage, WizardCopyField } from "./protocol.js";
 import { WizardController } from "./wizard-controller.js";
 import { WizardStateStore, type PersistedWizardState, type WizardAccessMode } from "./wizard-state.js";
 
@@ -39,6 +47,7 @@ class ExtensionController {
   private readonly supervisor = new ProcessSupervisor();
   private readonly agentAuth = new AgentAuthSidecar();
   private readonly oauth: OAuthClientService;
+  private readonly oauthHandoff: OAuthHandoffIntentStore;
   private readonly cloudflareCredentials: CloudflareCredentialVault;
   private readonly mcpChanged = new vscode.EventEmitter<void>();
   private readonly disposables: vscode.Disposable[] = [];
@@ -55,11 +64,14 @@ class ExtensionController {
   private chatSetupInFlight?: Promise<boolean>;
   private chatCommandBusy = false;
   private collaborationMonitor?: { terminal: vscode.Terminal; configPath: string; workspace: string };
+  private fullAccessActivation?: { key: string; promise: Promise<boolean> };
+  private fullAccessAmbiguityWarning?: string;
   private disposing = false;
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.activeChatAgentId = context.workspaceState.get<string>(CHAT_AGENT_STATE_KEY);
     this.oauth = new OAuthClientService(context.secrets);
+    this.oauthHandoff = new OAuthHandoffIntentStore(context.workspaceState);
     this.cloudflareCredentials = new CloudflareCredentialVault(context.secrets);
     this.wizard = new WizardController(
       new WizardStateStore(context.workspaceState),
@@ -88,7 +100,9 @@ class ExtensionController {
   async activate(): Promise<void> {
     this.registerViews();
     this.registerCommands();
+    this.registerUriHandler();
     this.registerNativeMcpProvider();
+    await this.oauthHandoff.expire();
 
     this.disposables.push(
       this.supervisor.onDidChange(() => {
@@ -163,6 +177,9 @@ class ExtensionController {
     register("manageTrust", () => vscode.commands.executeCommand("workbench.trust.manage"));
     register("connectChatGpt", () => this.connectChatGpt());
     register("openChatGpt", () => this.openChatGptInVsCode());
+    register("reconnectChatGpt", () => this.reconnectChatGpt());
+    register("revokeChatGpt", () => this.revokeChatGpt());
+    register("cancelChatGptSetup", () => this.cancelChatGptSetup());
     register("setupChat", () => this.setupChat());
     register("sendChat", (value) => this.sendChat(typeof value === "string" ? value : ""));
     register("cancelChat", () => this.cancelChat());
@@ -174,6 +191,25 @@ class ExtensionController {
     register("spawnAgent", () => this.spawnAgent());
     register("stopAgent", (agentId) => this.stopAgent(typeof agentId === "string" ? agentId : ""));
     register("viewAgentOutput", (agentId) => this.viewAgentOutput(typeof agentId === "string" ? agentId : ""));
+  }
+
+  private registerUriHandler(): void {
+    this.disposables.push(vscode.window.registerUriHandler({
+      handleUri: async (uri) => {
+        try {
+          await this.handleExternalUri(uri);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "unknown error";
+          void vscode.window.showErrorMessage(`VSPiLink rejected the legacy OAuth link: ${message}`);
+        }
+      },
+    }));
+  }
+
+  private async handleExternalUri(uri: vscode.Uri): Promise<void> {
+    this.requireTrustedWorkspace();
+    if (uri.path !== "/open-oauth") throw new Error("unsupported VSPiLink link");
+    throw new Error("this route is retired; use “Connect ChatGPT via MCP”, which keeps ChatGPT OAuth in the system browser");
   }
 
   private registerNativeMcpProvider(): void {
@@ -188,7 +224,7 @@ class ExtensionController {
         const token = await this.oauth.storedNativeToken(snapshot.configPath, scope);
         if (!token) return [];
         return [new vscode.McpHttpServerDefinition(
-          "VSPiLink",
+          snapshot.connectionName,
           vscode.Uri.parse(`${localServerUrl(snapshot)}/sse`),
           { Authorization: `Bearer ${token}` },
           this.mcpVersion(snapshot, scope),
@@ -223,10 +259,8 @@ class ExtensionController {
     const nativeScope = this.nativeScope();
     const approvedNativeScope = await this.oauth.approvedNativeScope(snapshot.configPath);
     const nativeConnected = approvedNativeScope === nativeScope && Boolean(await this.oauth.storedNativeToken(snapshot.configPath, nativeScope));
-    const mayUseTransientPublicUrl = snapshot.hostingMode === "quick-tunnel" || snapshot.hostingMode === "nip-io";
     const publicUrl = (
       (managedHosting.configured ? managedHosting.publicUrl : undefined) ||
-      (mayUseTransientPublicUrl ? this.supervisor.capturedPublicUrl : undefined) ||
       snapshot.serverUrl ||
       localServerUrl(snapshot)
     ).replace(/\/$/, "");
@@ -235,11 +269,18 @@ class ExtensionController {
     const adminStatus = health.online && snapshot.bootstrapSecret
       ? await readAdminStatus(snapshot.port, snapshot.bootstrapSecret)
       : { online: false, chatGptConnected: false, activeSessions: 0, payload: null };
-    const persistedChatGptClients = snapshot.clients.filter((client) => client.chatGpt);
+    const staleChatGptClients = snapshot.clients.filter((client) => client.chatGpt && client.stale);
+    const persistedChatGptClients = snapshot.clients.filter((client) => client.chatGpt && !client.stale);
     const chatGptActive = adminStatus.chatGptConnected;
     const chatGptConfigured = persistedChatGptClients.length > 0 || chatGptActive;
     const chatGptAuthorized = persistedChatGptClients.some((client) => client.authorized);
     const chatGptConnected = chatGptAuthorized || chatGptActive;
+    if (chatGptAuthorized && await this.ensureWizardFullAccessBinding(snapshot, persistedChatGptClients)) {
+      return this.dashboardState();
+    }
+    const handoff = chatGptAuthorized && /^https:\/\//iu.test(publicUrl)
+      ? await this.oauthHandoff.consume(this.oauthHandoffTarget(snapshot, publicUrl, `${publicUrl}/sse`))
+      : { status: "missing" as const };
     const collaborationPromise = adminStatus.online && snapshot.bootstrapSecret
       ? readAdminCollaboration(snapshot.port, snapshot.bootstrapSecret).then(
           (value) => ({ available: true as const, ...value }),
@@ -267,6 +308,9 @@ class ExtensionController {
       collaborationPromise,
     ]);
     if (chatGptConnected) await this.wizard.noteChatGptConnected();
+    if (handoff.status === "consumed") {
+      void this.openChatGpt("chat").catch(() => undefined);
+    }
     const processState = effectiveProcessState(
       this.supervisor.viewState,
       adminStatus.online,
@@ -278,6 +322,13 @@ class ExtensionController {
       trusted: vscode.workspace.isTrusted,
       workspace: snapshot.workspace,
       configPath: snapshot.configPath,
+      instanceId: snapshot.instanceId,
+      instanceLabel: snapshot.instanceLabel,
+      instanceFingerprint: snapshot.instanceFingerprint,
+      connectionFingerprint: snapshot.connectionFingerprint,
+      connectionName: snapshot.connectionName,
+      connectionDescription: snapshot.connectionDescription,
+      connectionKey: snapshot.connectionKey,
       process: processState,
       health: health.online
         ? { online: true, ...stableDashboardHealth(health.payload) }
@@ -302,6 +353,7 @@ class ExtensionController {
         authorized: chatGptAuthorized,
         active: chatGptActive,
         connected: chatGptConnected,
+        staleConnections: staleChatGptClients.length,
         activeSessions: adminStatus.activeSessions,
       },
       collaboration,
@@ -330,6 +382,9 @@ class ExtensionController {
       manageTrust: "vspilink.manageTrust",
       connectChatGpt: "vspilink.connectChatGpt",
       openChatGpt: "vspilink.openChatGpt",
+      reconnectChatGpt: "vspilink.reconnectChatGpt",
+      revokeChatGpt: "vspilink.revokeChatGpt",
+      cancelChatGptSetup: "vspilink.cancelChatGptSetup",
       setupChat: "vspilink.setupChat",
       sendChat: "vspilink.sendChat",
       cancelChat: "vspilink.cancelChat",
@@ -392,6 +447,9 @@ class ExtensionController {
     this.requireTrustedWorkspace();
     const snapshot = this.snapshot();
     if (!snapshot.configured) throw new Error("Configure VSPiLink before enabling Full access.");
+    if (snapshot.hostingMode === "quick-tunnel") {
+      throw new Error("Full access requires a stable HTTPS origin. Replace the temporary Quick Tunnel with a Named Tunnel or existing HTTPS domain first.");
+    }
     const eligibleClients = snapshot.clients.filter((client) => (
       client.grantTypes.includes("authorization_code") && client.scope.split(/\s+/u).includes("mcp:tools")
     ));
@@ -421,7 +479,7 @@ class ExtensionController {
     );
     if (confirmation !== "Authorize this client") return;
 
-    this.writeFullAccessConfiguration(snapshot, selected.id, false);
+    this.writeFullAccessConfiguration(snapshot, selected.id, true);
     if (snapshot.hostingMode === "cloudflare-named") {
       await this.restartManagedChatServer(this.snapshot(snapshot.workspace));
       const health = await waitForHealth(snapshot.port, 120_000);
@@ -451,10 +509,121 @@ class ExtensionController {
     writePrivateFile(snapshot.configPath, contents.endsWith("\n") ? contents : `${contents}\n`);
   }
 
+  private ensureWizardFullAccessBinding(
+    snapshot: ConfigSnapshot,
+    currentClients: readonly PublicClientSummary[],
+  ): Promise<boolean> {
+    const wizard = this.wizard.currentState;
+    const selection = selectPendingFullAccessClient({
+      accessMode: wizard.accessMode,
+      configPath: wizard.configPath,
+      publicUrl: wizard.publicUrl,
+      mcpUrl: wizard.mcpUrl,
+      preferredClientId: wizard.credential?.clientId,
+    }, {
+      configPath: snapshot.configPath,
+      publicOrigin: snapshot.serverUrl,
+    }, currentClients);
+    if (selection.status !== "selected") {
+      if (selection.status === "ambiguous") {
+        const warningKey = `${snapshot.connectionKey}:${selection.clientIds.join(",")}`;
+        if (this.fullAccessAmbiguityWarning !== warningKey) {
+          this.fullAccessAmbiguityWarning = warningKey;
+          void vscode.window.showWarningMessage(
+            `${snapshot.connectionName} has multiple authorized ChatGPT clients. Full access remains disabled until you choose the exact client with “VSPiLink: Enable Full Access”.`,
+          );
+        }
+      }
+      return Promise.resolve(false);
+    }
+    const selected = selection.client;
+    const alreadyBound = snapshot.unsafeFullAccess &&
+      !snapshot.fullAccessClientIds.includes("*") &&
+      snapshot.fullAccessClientIds.includes(selected.id) &&
+      snapshot.values.PI_REQUIRE_EXECUTION_APPROVAL === "true";
+    if (alreadyBound) return Promise.resolve(false);
+    const key = `${snapshot.connectionKey}:${selected.id}`;
+    if (this.fullAccessActivation?.key === key) return this.fullAccessActivation.promise;
+    const promise = this.applyFullAccessClient(snapshot, selected.id).finally(() => {
+      if (this.fullAccessActivation?.key === key) this.fullAccessActivation = undefined;
+    });
+    this.fullAccessActivation = { key, promise };
+    return promise;
+  }
+
+  private async applyFullAccessClient(snapshot: ConfigSnapshot, clientId: string): Promise<boolean> {
+    const hosting = this.wizard.currentState.appliedHosting || this.wizard.currentState.hosting;
+    if (snapshot.hostingMode !== "cloudflare-named" && (!hosting || hosting.kind === "quick-tunnel")) {
+      throw new Error("Full access requires a stable managed endpoint and was not activated.");
+    }
+    this.writeFullAccessConfiguration(snapshot, clientId, true);
+    const configured = this.snapshot(snapshot.workspace);
+    if (configured.hostingMode === "cloudflare-named") {
+      await this.restartManagedChatServer(configured);
+    } else {
+      if (this.supervisor.isActive) await this.supervisor.stop();
+      const plan = hostingStartPlan(hosting as HostingSelection);
+      await this.runCli([plan.command], `Full access · ${clientId}`, false, configured.workspace);
+    }
+    const health = await waitForHealth(configured.port, 120_000);
+    if (!health.online) {
+      throw new Error(`VSPiLink did not restart with client-bound Full access: ${health.error || "timeout"}`);
+    }
+    this.mcpChanged.fire();
+    await this.dashboard.refresh();
+    return true;
+  }
+
   private async guidedSetup(): Promise<void> {
     this.requireTrustedWorkspace();
+    await this.oauthHandoff.clear();
     const workspace = await this.selectWorkspace();
     if (!workspace) return;
+    const folder = vscode.workspace.workspaceFolders?.find((entry) => path.resolve(entry.uri.fsPath) === path.resolve(workspace));
+    const executionTarget = vscode.env.remoteName
+      ? `Remote extension host: ${folder?.uri.authority || vscode.env.remoteName}`
+      : `Local extension host: ${os.hostname()}`;
+    const targetConfirmation = await vscode.window.showInformationMessage(
+      "Confirm where VSPiLink will run",
+      {
+        modal: true,
+        detail: `${executionTarget}\nCurrent workspace: ${workspace}\n\nThe server identity belongs to this machine. The workspace can be changed later without changing that identity.`,
+      },
+      "Use this target",
+    );
+    if (targetConfirmation !== "Use this target") return;
+    let sidecarNode = this.sidecarNodeRuntime();
+    if (!sidecarNode.ok) {
+      const provision = await vscode.window.showInformationMessage(
+        "Install the supported VSPiLink runtime?",
+        {
+          modal: true,
+          detail: `${sidecarNode.error}\n\nVSPiLink can download the official Node.js archive, verify its pinned SHA-256, and install it in private per-user application data on this extension host.`,
+        },
+        "Install and verify Node 24.18.0",
+      );
+      if (provision !== "Install and verify Node 24.18.0") return;
+      await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: "Provision the VSPiLink Node runtime",
+        cancellable: false,
+      }, async (progress) => {
+        await provisionManagedNodeRuntime({ report: (message) => progress.report({ message }) });
+      });
+      this.sidecarNodeCache = undefined;
+      sidecarNode = this.sidecarNodeRuntime();
+      if (!sidecarNode.ok) throw new Error(sidecarNode.error);
+    }
+    const identitySnapshot = this.snapshot(workspace);
+    if (!identitySnapshot.configured) {
+      provisionWizardConfiguration({
+        configPath: identitySnapshot.configPath,
+        workspace,
+        hosting: { kind: "local" },
+        port: identitySnapshot.port,
+      });
+      this.mcpChanged.fire();
+    }
     const selected = await vscode.window.showQuickPick([
       {
         label: "Cloudflare Named Tunnel",
@@ -491,22 +660,25 @@ class ExtensionController {
       return;
     }
 
-    const hosting = await this.collectHostingSelection(selected.value);
+    const hosting = await this.collectHostingSelection(selected.value, workspace);
     if (!hosting) return;
-    const access = await vscode.window.showQuickPick([
+    const accessChoices = [
       {
         label: "Project folder only",
         description: "Recommended · files are confined and shell access is disabled",
         value: "workspace" as const,
       },
-      {
+      ...(hosting.kind === "quick-tunnel" ? [] : [{
         label: "Full access",
-        description: "High risk · global file system and process execution",
+        description: "High risk · granted only to the exact authorized ChatGPT OAuth client",
         value: "full" as const,
-      },
-    ], {
+      }]),
+    ];
+    const access = await vscode.window.showQuickPick(accessChoices, {
       title: "Advanced VSPiLink · 2 of 2 · Permissions",
-      placeHolder: "Choose the boundary enforced for MCP clients",
+      placeHolder: hosting.kind === "quick-tunnel"
+        ? "Temporary origins use Project folder only. Choose a stable origin before granting Full access."
+        : "Choose the boundary enforced for the server-specific ChatGPT client",
     });
     if (!access) return;
     if (access.value === "full" && !await this.confirmWizardFullAccess()) return;
@@ -529,6 +701,7 @@ class ExtensionController {
         publicUrl: runtime.publicUrl,
         mcpUrl: runtime.mcpUrl,
         hosting,
+        accessMode: access.value,
       });
       this.mcpChanged.fire();
       await this.dashboard.refresh();
@@ -538,7 +711,7 @@ class ExtensionController {
     this.mcpChanged.fire();
     await this.dashboard.refresh();
     const action = await vscode.window.showInformationMessage(
-      `MCP server ready: ${runtime.mcpUrl}`,
+      `${this.snapshot(workspace).connectionName} is ready at ${runtime.mcpUrl}`,
       "Copy endpoint",
     );
     if (action === "Copy endpoint") await vscode.env.clipboard.writeText(runtime.mcpUrl);
@@ -546,6 +719,7 @@ class ExtensionController {
 
   private async collectHostingSelection(
     kind: Exclude<HostingSelection["kind"], "nip-io">,
+    workspace: string,
   ): Promise<HostingSelection | undefined> {
     if (kind === "local" || kind === "quick-tunnel") return { kind };
     if (kind === "custom-domain") {
@@ -574,9 +748,11 @@ class ExtensionController {
       return normalized;
     }
 
+    const instance = this.snapshot(workspace);
+    const instanceSuffix = `${instance.instanceSlug}-${instance.instanceFingerprint}`;
     const tunnelName = await vscode.window.showInputBox({
       title: "Cloudflare tunnel name",
-      value: "vspilink",
+      value: `vspilink-${instanceSuffix}`,
       placeHolder: "vspilink-client",
       ignoreFocusOut: true,
       validateInput: validateTunnelName,
@@ -591,16 +767,16 @@ class ExtensionController {
     if (!zoneName) return undefined;
     const mcpHostname = await vscode.window.showInputBox({
       title: "MCP server hostname",
-      value: `mcp.${zoneName.trim().toLowerCase()}`,
-      placeHolder: "mcp.example.com",
+      value: `mcp-${instanceSuffix}.${zoneName.trim().toLowerCase()}`,
+      placeHolder: "mcp-server-id.example.com",
       ignoreFocusOut: true,
       validateInput: (value) => validateHostnameInZone(value, zoneName),
     });
     if (!mcpHostname) return undefined;
     const landingHostname = await vscode.window.showInputBox({
       title: "VSPiLink page hostname",
-      value: `vspilink.${zoneName.trim().toLowerCase()}`,
-      placeHolder: "vspilink.example.com",
+      value: `vspilink-${instanceSuffix}.${zoneName.trim().toLowerCase()}`,
+      placeHolder: "vspilink-server-id.example.com",
       ignoreFocusOut: true,
       validateInput: (value) => {
         const invalid = validateHostnameInZone(value, zoneName);
@@ -613,8 +789,13 @@ class ExtensionController {
     if (!landingHostname) return undefined;
     const auth = await vscode.window.showQuickPick([
       {
-        label: "Cloudflare account certificate",
-        description: "VSPiLink creates the tunnel and DNS records",
+        label: "Sign in to Cloudflare",
+        description: "Recommended · opens Cloudflare once, then VSPiLink creates or reuses the tunnel and DNS records",
+        value: "cloudflare-login" as const,
+      },
+      {
+        label: "Use an existing Cloudflare account certificate",
+        description: "Advanced · select an existing cert.pem on this extension host",
         value: "origin-certificate" as const,
       },
       {
@@ -624,10 +805,15 @@ class ExtensionController {
       },
     ], { title: "Cloudflare credential", placeHolder: "The credential remains local" });
     if (!auth) return undefined;
-    const credential = await this.selectCloudflareCredential(auth.value);
+    const authKind: CloudflareAuthKind = auth.value === "cloudflare-login"
+      ? "origin-certificate"
+      : auth.value;
+    const credential = auth.value === "cloudflare-login"
+      ? await this.loginCloudflareCredential(workspace)
+      : await this.selectCloudflareCredential(authKind, workspace);
     if (!credential) return undefined;
     let tunnelId: string | undefined;
-    if (auth.value === "tunnel-token-file") {
+    if (authKind === "tunnel-token-file") {
       tunnelId = await vscode.window.showInputBox({
         title: "Existing tunnel UUID",
         placeHolder: "00000000-0000-4000-8000-000000000000",
@@ -642,7 +828,7 @@ class ExtensionController {
       zoneName,
       mcpHostname,
       landingHostname,
-      cloudflareAuthKind: auth.value,
+      cloudflareAuthKind: authKind,
       ...(tunnelId ? { tunnelId } : {}),
       credentialReference: credential.reference,
       credentialLabel: credential.label,
@@ -664,6 +850,7 @@ class ExtensionController {
 
   private async reset(): Promise<void> {
     this.requireTrustedWorkspace();
+    await this.oauthHandoff.clear();
     const snapshot = this.snapshot();
     if (this.supervisor.isActive || snapshot.hostingMode === "cloudflare-named") {
       const action = await vscode.window.showWarningMessage(
@@ -698,7 +885,7 @@ class ExtensionController {
   private async copyMcpUrl(): Promise<void> {
     const state = await this.dashboardState();
     await vscode.env.clipboard.writeText(state.mcpUrl);
-    void vscode.window.showInformationMessage(`MCP URL copied: ${state.mcpUrl}`);
+    void vscode.window.showInformationMessage(`MCP URL copied for ${state.connectionName}: ${state.mcpUrl}`);
   }
 
   private async registerClient(): Promise<void> {
@@ -919,6 +1106,7 @@ class ExtensionController {
 
   private async selectCloudflareCredential(
     kind: CloudflareAuthKind,
+    workspace = this.snapshot().workspace,
   ): Promise<CloudflareCredentialSummary | undefined> {
     this.requireTrustedWorkspace();
     const selected = await vscode.window.showOpenDialog({
@@ -934,15 +1122,82 @@ class ExtensionController {
     if (!selectedPath) return undefined;
     let valid = false;
     try {
-      const status = fs.statSync(selectedPath);
-      valid = status.isFile() && status.size > 0 && status.size <= 64 * 1024;
+      const status = fs.lstatSync(selectedPath);
+      valid = status.isFile() && !status.isSymbolicLink() && status.size > 0 && status.size <= 64 * 1024;
     } catch {
       valid = false;
     }
     if (!valid) {
       throw new Error("The Cloudflare credential must be a non-empty file no larger than 64 KiB.");
     }
-    return this.cloudflareCredentials.store(kind, selectedPath);
+    const canonicalPath = assertPrivateCredentialOutsideCapabilityRoot(workspace, selectedPath);
+    return this.cloudflareCredentials.store(kind, canonicalPath);
+  }
+
+  private async loginCloudflareCredential(workspace: string): Promise<CloudflareCredentialSummary | undefined> {
+    this.requireTrustedWorkspace();
+    const snapshot = this.snapshot(workspace);
+    const cloudflaredPath = await this.ensureCloudflaredExecutable(snapshot);
+    const certificatePath = path.join(os.homedir(), ".cloudflared", "cert.pem");
+    const cancellation = new AbortController();
+    const result = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: "Connect VSPiLink to Cloudflare",
+      cancellable: true,
+    }, async (progress, token) => {
+      progress.report({ message: "Complete the Cloudflare authorization page opened in your system browser…" });
+      const subscription = token.onCancellationRequested(() => cancellation.abort());
+      try {
+        return await loginCloudflare({
+          executable: cloudflaredPath,
+          certificatePath,
+          signal: cancellation.signal,
+        }, {
+          openExternal: (url) => vscode.env.openExternal(vscode.Uri.parse(url, true)),
+        });
+      } finally {
+        subscription.dispose();
+      }
+    });
+    if (result.status === "canceled") return undefined;
+    const canonicalPath = assertPrivateCredentialOutsideCapabilityRoot(workspace, result.certificatePath);
+    return this.cloudflareCredentials.store("origin-certificate", canonicalPath);
+  }
+
+  private async ensureCloudflaredExecutable(snapshot: ConfigSnapshot, allowInstall = true): Promise<string> {
+    const managedPath = path.join(path.dirname(snapshot.configPath), "bin", "cloudflared");
+    try {
+      return absoluteExecutable(snapshot.values.PI_CLOUDFLARED_PATH || "cloudflared", [
+        managedPath,
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+      ]);
+    } catch (error) {
+      if (!allowInstall) throw error;
+      const install = await vscode.window.showInformationMessage(
+        "Install the supported Cloudflare tunnel helper?",
+        {
+          modal: true,
+          detail: `${error instanceof Error ? error.message : String(error)}\n\nVSPiLink can download cloudflared ${MANAGED_CLOUDFLARED_VERSION}, verify its release-pinned SHA-256, and install it in the private VSPiLink data directory on this extension host.`,
+        },
+        `Install and verify cloudflared ${MANAGED_CLOUDFLARED_VERSION}`,
+      );
+      if (install !== `Install and verify cloudflared ${MANAGED_CLOUDFLARED_VERSION}`) {
+        throw new Error("Cloudflare setup requires cloudflared. Installation was canceled.");
+      }
+      const provisioned = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: "Provision the VSPiLink Cloudflare helper",
+        cancellable: false,
+      }, async (progress) => provisionManagedCloudflared({
+        destination: managedPath,
+        report: (message) => progress.report({ message }),
+      }));
+      let contents = fs.readFileSync(snapshot.configPath, "utf8");
+      contents = updateEnvValue(contents, "PI_CLOUDFLARED_PATH", provisioned.executable);
+      writePrivateFile(snapshot.configPath, contents.endsWith("\n") ? contents : `${contents}\n`);
+      return provisioned.executable;
+    }
   }
 
   private async provisionWizard(
@@ -951,6 +1206,9 @@ class ExtensionController {
     accessMode: WizardAccessMode,
   ): Promise<{ configPath: string }> {
     this.requireTrustedWorkspace();
+    if (accessMode === "full" && hosting.kind === "quick-tunnel") {
+      throw new Error("Full access requires a stable HTTPS origin so it can be bound to one durable ChatGPT OAuth client. Choose Named Tunnel or Existing HTTPS domain.");
+    }
     const snapshot = this.snapshot(workspace);
     provisionWizardConfiguration({
       configPath: snapshot.configPath,
@@ -961,7 +1219,8 @@ class ExtensionController {
     if (accessMode === "full") {
       let contents = fs.readFileSync(snapshot.configPath, "utf8");
       contents = updateEnvValue(contents, "PI_UNSAFE_FULL_ACCESS", "true");
-      contents = updateEnvValue(contents, "PI_REQUIRE_EXECUTION_APPROVAL", "false");
+      contents = removeEnvValue(contents, "PI_FULL_ACCESS_CLIENT_IDS");
+      contents = updateEnvValue(contents, "PI_REQUIRE_EXECUTION_APPROVAL", "true");
       writePrivateFile(snapshot.configPath, contents.endsWith("\n") ? contents : `${contents}\n`);
     }
     if (hosting.kind === "cloudflare-named") {
@@ -999,6 +1258,9 @@ class ExtensionController {
     accessMode: WizardAccessMode,
   ): Promise<{ configPath: string; publicUrl: string; mcpUrl: string }> {
     this.requireTrustedWorkspace();
+    if (accessMode === "full" && hosting.kind === "quick-tunnel") {
+      throw new Error("Full access is not available for a temporary Quick Tunnel origin. Choose a stable HTTPS endpoint.");
+    }
     if (hosting.kind === "nip-io") {
       throw new Error("nip.io mode requires advanced network configuration. Use “Run Legacy Setup in the Terminal”, or choose Cloudflare or a stable HTTPS domain.");
     }
@@ -1013,6 +1275,8 @@ class ExtensionController {
       const publicUrl = (hosting.publicUrl as string).replace(/\/$/, "");
       const publicHealth = await waitForPublicHealth(publicUrl, 60_000);
       if (!publicHealth.online) throw new Error(`The Cloudflare endpoint is not ready: ${publicHealth.error || "timeout"}`);
+      await this.ensurePersistentUserServices();
+      await this.attestWizardEndpoint(this.snapshot(workspace), publicUrl);
       const status = await this.runNamedHostingCli("status", namedHosting, snapshot, false);
       if (jsonObject(status.result)?.productionReady !== true) {
         throw new Error("The Cloudflare services are running, but production readiness has not been reached yet.");
@@ -1022,7 +1286,7 @@ class ExtensionController {
     if (this.supervisor.isActive) await this.supervisor.stop();
     const snapshot = this.snapshot(workspace);
     const plan = hostingStartPlan(hosting);
-    const args = [plan.command, ...(accessMode === "full" ? ["--allow-unsafe-full-access"] : [])];
+    const args = [plan.command];
     await this.runCli(
       args,
       `${plan.public ? "Public" : "Local"} · ${accessMode === "full" ? "Full access" : "Project folder only"}`,
@@ -1044,7 +1308,57 @@ class ExtensionController {
     }
     if (plan.public) await this.skipLegacyCallbackPrompt();
     const normalized = publicUrl.replace(/\/$/, "");
+    if (hosting.kind === "quick-tunnel") persistEffectivePublicOrigin(snapshot.configPath, normalized);
+    if (plan.public) await this.attestWizardEndpoint(this.snapshot(workspace), normalized);
     return { configPath: snapshot.configPath, publicUrl: normalized, mcpUrl: `${normalized}/sse` };
+  }
+
+  private async attestWizardEndpoint(snapshot: ConfigSnapshot, publicUrl: string): Promise<void> {
+    const normalizedOrigin = new URL(publicUrl).origin;
+    if (snapshot.serverUrl !== normalizedOrigin) {
+      throw new Error("The persisted VSPiLink origin changed while the endpoint was starting. Retry setup before OAuth pairing.");
+    }
+    await attestEndpoint({
+      localOrigin: localServerUrl(snapshot),
+      expectedIdentity: {
+        instanceId: snapshot.instanceId,
+        instanceLabel: snapshot.instanceLabel,
+        instanceSlug: snapshot.instanceSlug,
+        instanceFingerprint: snapshot.instanceFingerprint,
+        publicOrigin: snapshot.serverUrl,
+        connectionFingerprint: snapshot.connectionFingerprint,
+        connectionName: snapshot.connectionName,
+        connectionDescription: snapshot.connectionDescription,
+        connectionKey: snapshot.connectionKey,
+      },
+      timeoutMs: 15_000,
+    });
+  }
+
+  private async ensurePersistentUserServices(): Promise<void> {
+    const user = os.userInfo().username;
+    const inspected = await inspectUserLinger(user);
+    if (inspected.state === "enabled") return;
+    if (inspected.state === "unavailable") {
+      throw new Error(`${inspected.diagnostic} Persistent VSPiLink services cannot be verified across logout or reboot.`);
+    }
+    const confirmation = await vscode.window.showInformationMessage(
+      "Keep VSPiLink available after logout and reboot?",
+      {
+        modal: true,
+        detail: `VSPiLink needs systemd user lingering for ${user}. VS Code will run “loginctl enable-linger ${user}” directly and verify the result.`,
+      },
+      "Enable and verify",
+    );
+    if (confirmation !== "Enable and verify") {
+      throw new Error("User lingering remains disabled. Enable it before completing production setup.");
+    }
+    const outcome = await ensureUserLinger(user);
+    if (outcome.state === "enabled") return;
+    if (outcome.action === "manual-required" && outcome.manualCommand) {
+      throw new Error(`${outcome.diagnostic} Run the displayed command in an authorized terminal, then choose Retry.`);
+    }
+    throw new Error(`${outcome.diagnostic} Persistent VSPiLink services cannot be verified across logout or reboot.`);
   }
 
   private async skipLegacyCallbackPrompt(timeoutMs = 3_000): Promise<void> {
@@ -1059,7 +1373,6 @@ class ExtensionController {
   }
 
   private async pairWizardOwner(destination: ChatGptDestination): Promise<boolean> {
-    await this.requirePersistentBrowserStorage();
     const state = this.wizard.currentState;
     if (!state.publicUrl) throw new Error("The public VSPiLink host is unavailable for OAuth pairing.");
     const snapshot = this.wizardSnapshot(state);
@@ -1069,12 +1382,40 @@ class ExtensionController {
     const navigation = chatGptNavigation(destination);
     const pairedNavigation = new URL(pairingUrl);
     pairedNavigation.searchParams.set("continue", navigation.url);
-    const opened = await this.openIntegratedBrowser(
-      pairedNavigation.toString(),
-      `${state.publicUrl.replace(/\/$/u, "")}/oauth/pair*`,
+    if (destination === "plugins") {
+      await this.oauthHandoff.begin(this.oauthHandoffTarget(snapshot, state.publicUrl, `${state.publicUrl.replace(/\/$/u, "")}/sse`));
+    }
+    let opened = false;
+    try {
+      opened = await vscode.env.openExternal(vscode.Uri.parse(pairedNavigation.toString(), true));
+    } catch (error) {
+      if (destination === "plugins") await this.oauthHandoff.clear();
+      throw error;
+    }
+    if (!opened) {
+      if (destination === "plugins") await this.oauthHandoff.clear();
+      throw new Error("The system browser did not open the one-time VSPiLink authorization page.");
+    }
+    void vscode.window.showInformationMessage(
+      "Complete the one-time VSPiLink connection in your system browser. After approval, ChatGPT returns inside VS Code automatically.",
     );
-    if (!opened) throw new Error("The browser did not open the VSPiLink pairing page.");
     return true;
+  }
+
+  private oauthHandoffTarget(
+    snapshot: ConfigSnapshot,
+    publicUrl: string,
+    mcpUrl: string,
+  ): OAuthHandoffIdentity {
+    return {
+      configPath: path.resolve(snapshot.configPath),
+      instanceId: snapshot.instanceId,
+      connectionKey: snapshot.connectionKey,
+      connectionFingerprint: snapshot.connectionFingerprint,
+      publicOrigin: new URL(publicUrl).origin,
+      mcpUrl,
+      workspace: path.resolve(snapshot.workspace),
+    };
   }
 
   private async openChatGpt(destination: ChatGptDestination): Promise<void> {
@@ -1083,54 +1424,22 @@ class ExtensionController {
     if (!opened) throw new Error("The browser did not open the official ChatGPT page.");
   }
 
-  /**
-   * Open a real top-level browser editor, not an iframe-backed webview.  This
-   * keeps ChatGPT's login and the one-use PiLink owner cookie in the same VS
-   * Code browser profile.  Older VS Code builds fall back to the system
-   * browser without ever attempting the blocked Simple Browser embedding.
-   */
+  /** Open ChatGPT only in VS Code's top-level integrated browser editor. */
   private async openIntegratedBrowser(url: string, reuseUrlFilter?: string): Promise<boolean> {
     const parsed = vscode.Uri.parse(url, true);
-    const commands = await vscode.commands.getCommands(true);
-    let integratedBrowserFailed = false;
-    if (commands.includes("workbench.action.browser.open")) {
-      try {
-        await vscode.commands.executeCommand("workbench.action.browser.open", {
-          url: parsed.toString(true),
-          openToSide: true,
-          ...(reuseUrlFilter ? { reuseUrlFilter } : {}),
-        });
-        return true;
-      } catch {
-        integratedBrowserFailed = true;
-      }
+    try {
+      await vscode.commands.executeCommand("workbench.action.browser.open", {
+        url: parsed.toString(true),
+        openToSide: true,
+        ...(reuseUrlFilter ? { reuseUrlFilter } : {}),
+      });
+      return true;
+    } catch {
+      void vscode.window.showErrorMessage(
+        "VS Code's integrated browser is unavailable. Reload or update VS Code, then run the VSPiLink action again.",
+      );
+      return false;
     }
-    const action = await vscode.window.showWarningMessage(
-      integratedBrowserFailed
-        ? "VS Code's integrated browser could not open this page."
-        : "This version of VS Code does not provide the integrated browser required by VSPiLink.",
-      {
-        modal: true,
-        detail: "The system browser will open only if you choose it explicitly. During an SSH session, it may be on a different computer.",
-      },
-      "Open in system browser",
-    );
-    if (action !== "Open in system browser") return false;
-    return vscode.env.openExternal(parsed);
-  }
-
-  private async requirePersistentBrowserStorage(): Promise<void> {
-    const storage = vscode.workspace.getConfiguration("workbench.browser").get<string>("dataStorage", "global");
-    if (storage !== "ephemeral") return;
-    const action = await vscode.window.showWarningMessage(
-      "The integrated browser uses ephemeral storage, so the VSPiLink consent page and ChatGPT cannot share the OAuth session.",
-      { modal: true, detail: "Open Workbench › Browser: Data Storage, select Global or Workspace, then run “Connect ChatGPT via MCP” again." },
-      "Open setting",
-    );
-    if (action === "Open setting") {
-      await vscode.commands.executeCommand("workbench.action.openSettings", "workbench.browser.dataStorage");
-    }
-    throw new Error("Set Workbench › Browser: Data Storage to Global or Workspace before connecting ChatGPT.");
   }
 
   private async connectChatGpt(): Promise<void> {
@@ -1148,8 +1457,20 @@ class ExtensionController {
       if (!health.online) throw new Error(`The MCP server is unreachable: ${health.error || "timeout"}.`);
       snapshot = this.snapshot();
     }
+    snapshot = await this.synchronizeQuickTunnelIdentity(snapshot);
 
     const state = await this.dashboardState();
+    snapshot = this.snapshot(snapshot.workspace);
+    if (
+      path.resolve(state.configPath) !== path.resolve(snapshot.configPath) ||
+      state.publicUrl !== snapshot.serverUrl ||
+      state.mcpUrl !== `${snapshot.serverUrl}/sse` ||
+      state.instanceId !== snapshot.instanceId ||
+      state.connectionKey !== snapshot.connectionKey ||
+      state.connectionFingerprint !== snapshot.connectionFingerprint
+    ) {
+      throw new Error("The VSPiLink identity changed before ChatGPT confirmation. Refresh and retry; no connection was opened.");
+    }
     let origin: URL;
     try {
       origin = new URL(state.publicUrl);
@@ -1158,6 +1479,10 @@ class ExtensionController {
     }
     if (origin.protocol !== "https:" || isLoopbackBrowserHost(origin.hostname)) {
       await this.guidedSetup();
+      return;
+    }
+
+    if (!state.externalMcp.connected && !await this.confirmChatGptTarget(snapshot, state.publicUrl, state.mcpUrl)) {
       return;
     }
 
@@ -1174,7 +1499,7 @@ class ExtensionController {
       });
       if (state.externalMcp.connected) {
         await this.wizard.noteChatGptConnected();
-        await this.openChatGpt("work");
+        await this.openChatGpt("chat");
         return;
       }
       await this.pairWizardOwner("plugins");
@@ -1189,13 +1514,38 @@ class ExtensionController {
       ...(hosting ? { hosting } : {}),
     });
     await vscode.env.clipboard.writeText(state.mcpUrl);
+    void vscode.window.showInformationMessage(
+      `Create a NEW ChatGPT connection named “${snapshot.connectionName}”. Its MCP endpoint is already copied. Do not reuse another server\'s VSPiLink connection.`,
+    );
     await this.wizard.handle({
       type: "wizard",
       action: "openChatGpt",
       requestId: `connect-${Date.now()}`,
-      destination: "work",
+      destination: "plugins",
     });
     await this.dashboard.refresh();
+  }
+
+  private async confirmChatGptTarget(snapshot: ConfigSnapshot, publicUrl: string, mcpUrl: string): Promise<boolean> {
+    const confirmation = await vscode.window.showInformationMessage(
+      "Confirm the exact VSPiLink target",
+      {
+        modal: true,
+        detail: [
+          `Connection: ${snapshot.connectionName}`,
+          `Description: ${snapshot.connectionDescription}`,
+          `Machine: ${snapshot.instanceLabel} · ${snapshot.instanceFingerprint}`,
+          `Connection fingerprint: ${snapshot.connectionFingerprint}`,
+          `HTTPS origin: ${publicUrl}`,
+          `MCP URL: ${mcpUrl}`,
+          `Current workspace: ${snapshot.workspace}`,
+          "",
+          "ChatGPT must create or reconnect only this server-specific connection. Check every value before continuing.",
+        ].join("\n"),
+      },
+      "Continue to ChatGPT",
+    );
+    return confirmation === "Continue to ChatGPT";
   }
 
   private async openChatGptInVsCode(): Promise<void> {
@@ -1205,7 +1555,64 @@ class ExtensionController {
       await this.connectChatGpt();
       return;
     }
-    await this.openChatGpt("work");
+    await this.openChatGpt("chat");
+  }
+
+  private async reconnectChatGpt(): Promise<void> {
+    this.requireTrustedWorkspace();
+    const snapshot = this.snapshot();
+    const confirmation = await vscode.window.showWarningMessage(
+      `Reconnect ${snapshot.connectionName}?`,
+      {
+        modal: true,
+        detail: "The current server-specific ChatGPT OAuth client and its refresh-token family will be revoked. You will then create and approve a fresh connection for this exact origin.",
+      },
+      "Revoke and reconnect",
+    );
+    if (confirmation !== "Revoke and reconnect") return;
+    await this.deleteChatGptClients(snapshot);
+    await this.oauthHandoff.clear();
+    await this.wizard.forgetChatGptConnection();
+    await this.dashboard.refresh();
+    await this.connectChatGpt();
+  }
+
+  private async revokeChatGpt(): Promise<void> {
+    this.requireTrustedWorkspace();
+    const snapshot = this.snapshot();
+    const confirmation = await vscode.window.showWarningMessage(
+      `Revoke ${snapshot.connectionName}?`,
+      {
+        modal: true,
+        detail: "This deletes the local OAuth client and its refresh-token family. The ChatGPT entry will stop working and is not automatically recreated.",
+      },
+      "Revoke connection",
+    );
+    if (confirmation !== "Revoke connection") return;
+    await this.deleteChatGptClients(snapshot);
+    await this.oauthHandoff.clear();
+    await this.wizard.forgetChatGptConnection();
+    await this.dashboard.refresh();
+    void vscode.window.showInformationMessage(`${snapshot.connectionName} was revoked locally.`);
+  }
+
+  private async cancelChatGptSetup(): Promise<void> {
+    await this.oauthHandoff.clear();
+    await this.wizard.forgetChatGptConnection();
+    await this.dashboard.refresh();
+    void vscode.window.showInformationMessage("The pending ChatGPT handoff was canceled. The VSPiLink server remains configured.");
+  }
+
+  private async deleteChatGptClients(snapshot: ConfigSnapshot): Promise<void> {
+    let health = await readHealth(snapshot.port);
+    if (!health.online) {
+      await this.startConfigured();
+      health = await waitForHealth(snapshot.port, 120_000);
+    }
+    if (!health.online) throw new Error(`VSPiLink must be running before OAuth clients can be revoked: ${health.error || "timeout"}`);
+    snapshot = await this.synchronizeQuickTunnelIdentity(this.snapshot(snapshot.workspace));
+    const clientIds = snapshot.clients.filter((client) => client.chatGpt).map((client) => client.id);
+    for (const clientId of clientIds) await this.oauth.deleteExternalClient(snapshot, clientId);
   }
 
   private async registerChatGpt(callbackUrl: string) {
@@ -1214,19 +1621,14 @@ class ExtensionController {
     const health = await readHealth(snapshot.port);
     if (!health.online) throw new Error("Start VSPiLink before registering ChatGPT.");
     const registered = await this.oauth.registerExternalClient(snapshot, {
-      clientName: "ChatGPT VSPiLink",
+      clientName: snapshot.connectionName,
       grantTypes: ["authorization_code", "refresh_token"],
       redirectUris: [callbackUrl],
       allowedScope: "mcp:tools offline_access",
       tokenEndpointAuthMethod: "client_secret_post",
     });
     if (this.wizard.currentState.accessMode === "full") {
-      this.writeFullAccessConfiguration(this.snapshot(snapshot.workspace), registered.clientId, false);
-      if (snapshot.hostingMode === "cloudflare-named") {
-        await this.restartManagedChatServer(this.snapshot(snapshot.workspace));
-        const restarted = await waitForHealth(snapshot.port, 120_000);
-        if (!restarted.online) throw new Error(`VSPiLink did not restart after the client was authorized: ${restarted.error || "timeout"}`);
-      }
+      await this.applyFullAccessClient(this.snapshot(snapshot.workspace), registered.clientId);
     }
     return registered;
   }
@@ -1236,6 +1638,8 @@ class ExtensionController {
     state: Readonly<PersistedWizardState>,
   ): Promise<string | undefined> {
     if (field === "mcpUrl") return state.mcpUrl;
+    if (field === "connectionName") return this.wizardSnapshot(state).connectionName;
+    if (field === "connectionDescription") return this.wizardSnapshot(state).connectionDescription;
     if (field === "authorizationUrl") return state.publicUrl ? `${state.publicUrl.replace(/\/$/, "")}/oauth/authorize` : undefined;
     if (field === "tokenUrl") return state.publicUrl ? `${state.publicUrl.replace(/\/$/, "")}/oauth/token` : undefined;
     if (!state.configPath || !state.credential) return undefined;
@@ -1792,9 +2196,16 @@ class ExtensionController {
 
   private async startConfigured(): Promise<void> {
     this.requireTrustedWorkspace();
-    const snapshot = this.snapshot();
+    let snapshot = this.snapshot();
     if (snapshot.hostingMode !== "cloudflare-named") {
       await this.runCli(["start"], "Tunnel · secure");
+      if (snapshot.hostingMode === "quick-tunnel") {
+        const health = await waitForHealth(snapshot.port, 120_000);
+        if (!health.online) throw new Error(`VSPiLink did not become reachable: ${health.error || "timeout"}`);
+        snapshot = await this.synchronizeQuickTunnelIdentity(snapshot);
+        this.mcpChanged.fire();
+        await this.dashboard.refresh();
+      }
       return;
     }
     const hosting = await this.ensureNamedHostingSelection(snapshot);
@@ -1828,9 +2239,16 @@ class ExtensionController {
 
   private async restartConfigured(): Promise<void> {
     this.requireTrustedWorkspace();
-    const snapshot = this.snapshot();
+    let snapshot = this.snapshot();
     if (snapshot.hostingMode !== "cloudflare-named") {
       await this.supervisor.restart();
+      if (snapshot.hostingMode === "quick-tunnel") {
+        const health = await waitForHealth(snapshot.port, 120_000);
+        if (!health.online) throw new Error(`VSPiLink did not become reachable after restart: ${health.error || "timeout"}`);
+        snapshot = await this.synchronizeQuickTunnelIdentity(snapshot);
+        this.mcpChanged.fire();
+        await this.dashboard.refresh();
+      }
       return;
     }
     const hosting = await this.ensureNamedHostingSelection(snapshot);
@@ -1840,6 +2258,35 @@ class ExtensionController {
     this.invalidateManagedHosting();
     const health = await waitForHealth(snapshot.port, 120_000);
     if (!health.online) throw new Error(`The persistent service did not become reachable after restart: ${health.error || "timeout"}`);
+  }
+
+  /**
+   * Commit a Quick Tunnel's runtime origin before any UI or OAuth operation can
+   * use it. The authenticated local administration response is authoritative;
+   * captured process output may corroborate it but can never replace it.
+   */
+  private async synchronizeQuickTunnelIdentity(snapshot: ConfigSnapshot): Promise<ConfigSnapshot> {
+    if (snapshot.hostingMode !== "quick-tunnel") return snapshot;
+    if (!snapshot.bootstrapSecret) {
+      throw new Error("PI_BOOTSTRAP_SECRET is required to verify the current Quick Tunnel identity.");
+    }
+    const admin = await readAdminStatus(snapshot.port, snapshot.bootstrapSecret, 5_000);
+    const runtimeOrigin = admin.payload?.server_url;
+    if (!admin.online || typeof runtimeOrigin !== "string") {
+      throw new Error(`The current Quick Tunnel identity cannot be verified: ${admin.error || "authenticated runtime origin is unavailable"}.`);
+    }
+    const resolved = resolveQuickTunnelRuntimeIdentity({
+      persistedOrigin: snapshot.serverUrl,
+      runtimeOrigin,
+      ...(this.supervisor.capturedPublicUrl ? { capturedOrigin: this.supervisor.capturedPublicUrl } : {}),
+    });
+    if (resolved.changed) persistEffectivePublicOrigin(snapshot.configPath, resolved.origin);
+    const refreshed = this.snapshot(snapshot.workspace);
+    if (refreshed.serverUrl !== resolved.origin) {
+      throw new Error("The Quick Tunnel origin could not be committed to the selected VSPiLink configuration.");
+    }
+    await this.attestWizardEndpoint(refreshed, resolved.origin);
+    return refreshed;
   }
 
   private namedHostingSelection(snapshot: ConfigSnapshot): HostingSelection & { kind: "cloudflare-named" } {
@@ -1965,10 +2412,7 @@ class ExtensionController {
     const nodeExecutable = absoluteExecutable(sidecarNode.executable);
     const cliPath = resolveCliPath(this.context.extensionPath);
     if (!fs.existsSync(cliPath)) throw new Error(`PiLink runtime not found: ${cliPath}.`);
-    const cloudflaredPath = absoluteExecutable(snapshot.values.PI_CLOUDFLARED_PATH || "cloudflared", [
-      "/usr/local/bin/cloudflared",
-      "/usr/bin/cloudflared",
-    ]);
+    const cloudflaredPath = await this.ensureCloudflaredExecutable(snapshot, command !== "status");
     const systemctlPath = absoluteExecutable("systemctl", ["/usr/bin/systemctl", "/bin/systemctl"]);
     const systemdAnalyzePath = absoluteExecutable("systemd-analyze", ["/usr/bin/systemd-analyze", "/bin/systemd-analyze"]);
     const systemdUserDirectory = path.join(
@@ -2318,8 +2762,7 @@ class ExtensionController {
   }
 
   private mcpVersion(snapshot: ConfigSnapshot, scope: McpScope): string {
-    const configId = createHash("sha256").update(snapshot.configPath).digest("hex").slice(0, 12);
-    return `${this.context.extension.packageJSON.version || "1.1.0"}:${configId}:${scope}:${snapshot.port}`;
+    return `${this.context.extension.packageJSON.version || "1.1.0"}:${snapshot.connectionFingerprint}:${scope}:${snapshot.port}`;
   }
 
   private requireTrustedWorkspace(): void {

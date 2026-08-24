@@ -7,6 +7,7 @@ import {
   defaultConfigPath,
   localServerUrl,
   parseEnv,
+  persistEffectivePublicOrigin,
   provisionWizardConfiguration,
   readConfigSnapshot,
   resolveConfigPath,
@@ -61,6 +62,8 @@ test("wizard provisioning creates paired private configuration and manages two c
   });
   const custom = parseEnv(fs.readFileSync(configPath, "utf8"));
   assert.equal(custom.PI_WORK_DIR, workspace);
+  assert.match(custom.PI_INSTANCE_ID || "", /^[0-9a-f-]{36}$/u);
+  assert.ok((custom.PI_INSTANCE_LABEL || "").length > 0);
   assert.equal(custom.PORT, "4321");
   assert.equal(custom.PI_HOSTING_MODE, "external");
   assert.equal(custom.SERVER_URL, "https://mcp.example.test");
@@ -84,6 +87,8 @@ test("wizard provisioning creates paired private configuration and manages two c
   assert.equal(quick.TRUST_PROXY, "true");
   assert.equal(quick.JWT_SECRET, custom.JWT_SECRET);
   assert.equal(quick.PI_BOOTSTRAP_SECRET, custom.PI_BOOTSTRAP_SECRET);
+  assert.equal(quick.PI_INSTANCE_ID, custom.PI_INSTANCE_ID);
+  assert.equal(quick.PI_INSTANCE_LABEL, custom.PI_INSTANCE_LABEL);
 });
 
 test("updateEnvValue replaces or appends values and round-trips serialization", () => {
@@ -163,6 +168,23 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
     "PI_FULL_ACCESS_CLIENT_IDS=pi_1111111111111111,pi_2222222222222222",
     "PI_BOOTSTRAP_SECRET=bootstrap-value",
   ].join("\n"));
+  const expectedIdentity = readConfigSnapshot(configPath, path.join(root, "fallback"));
+  const bindingTarget = {
+    binding_version: 1,
+    instance_id: expectedIdentity.instanceId,
+    instance_fingerprint: expectedIdentity.instanceFingerprint,
+    public_origin: expectedIdentity.serverUrl,
+    connection_key: expectedIdentity.connectionKey,
+    connection_fingerprint: expectedIdentity.connectionFingerprint,
+    resource: expectedIdentity.serverUrl,
+  };
+  fs.writeFileSync(path.join(dataDir, "oauth-instance-binding.json"), JSON.stringify({
+    metadata_version: 1,
+    instance_id: expectedIdentity.instanceId,
+    instance_fingerprint: expectedIdentity.instanceFingerprint,
+    legacy_binding_target: bindingTarget,
+    created_at: "2026-08-03T00:00:00.000Z",
+  }));
   fs.writeFileSync(path.join(dataDir, "clients.json"), JSON.stringify({
     clients: [
       {
@@ -173,6 +195,7 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
         grant_types: ["authorization_code", 12, "client_credentials"],
         scope: "mcp:tools",
         created_at: "2026-08-03T00:00:00.000Z",
+        binding: { ...bindingTarget, client_kind: "confidential" },
       },
       {
         client_id: "pi_chatgpt00000001",
@@ -184,6 +207,7 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
         scope: "mcp:tools offline_access",
         created_at: "2026-08-03T01:00:00.000Z",
         token_version: 2,
+        binding: { ...bindingTarget, client_kind: "public" },
       },
       {
         client_id: "pi_disabled0000001",
@@ -208,6 +232,7 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
         created_at: new Date().toISOString(),
         expires_at: Date.now() + 60_000,
         client_version: 2,
+        binding: { ...bindingTarget, client_kind: "public" },
       },
       {
         token_hash: "b".repeat(64),
@@ -225,6 +250,15 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
   assert.equal(snapshot.dataDir, dataDir);
   assert.equal(snapshot.port, 4321);
   assert.equal(snapshot.serverUrl, "http://127.0.0.1:4321");
+  assert.match(snapshot.instanceId, /^[0-9a-f-]{36}$/u);
+  assert.match(snapshot.instanceFingerprint, /^[a-f0-9]{10}$/u);
+  assert.match(snapshot.connectionFingerprint, /^[a-f0-9]{10}$/u);
+  assert.match(snapshot.connectionName, /^VSPiLink — .+ · [a-f0-9]{10}$/u);
+  assert.equal(
+    snapshot.connectionDescription,
+    `Secure MCP coding-agent bridge to ${snapshot.instanceLabel} at ${snapshot.serverUrl} · ${snapshot.connectionFingerprint}`,
+  );
+  assert.match(snapshot.connectionKey, /^vspilink-[a-z0-9-]+-[a-f0-9]{10}$/u);
   assert.equal(snapshot.hostingMode, "quick-tunnel");
   assert.equal(snapshot.unsafeFullAccess, true);
   assert.deepEqual(snapshot.fullAccessClientIds, ["pi_1111111111111111", "pi_2222222222222222"]);
@@ -238,6 +272,7 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
     createdAt: "2026-08-03T00:00:00.000Z",
     chatGpt: false,
     authorized: false,
+    stale: false,
   }, {
     id: "pi_chatgpt00000001",
     name: "ChatGPT VSPiLink",
@@ -246,9 +281,18 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
     createdAt: "2026-08-03T01:00:00.000Z",
     chatGpt: true,
     authorized: true,
+    stale: false,
   }]);
   const publicClients = JSON.stringify(snapshot.clients);
   assert.doesNotMatch(publicClients, /client_secret|hash-must|plaintext-must/);
+
+  writePrivateFile(
+    configPath,
+    updateEnvValue(fs.readFileSync(configPath, "utf8"), "SERVER_URL", "https://new-origin.example.test"),
+  );
+  const changedOrigin = readConfigSnapshot(configPath, path.join(root, "fallback"));
+  assert.ok(changedOrigin.clients.every((client) => client.stale));
+  assert.ok(changedOrigin.clients.every((client) => !client.authorized));
 
   const missingConfigPath = path.join(root, "missing", ".env");
   const fallbackWorkspace = path.join(root, "fallback-workspace");
@@ -265,4 +309,42 @@ test("readConfigSnapshot applies defaults and never exposes client secret hashes
 
   const withoutFolder = readConfigSnapshot(missingConfigPath, "");
   assert.equal(withoutFolder.workspace, "");
+});
+
+test("legacy provisioning preserves identity and a Quick Tunnel persists its effective origin", (t) => {
+  const root = temporaryDirectory(t, "vspilink-effective-origin-");
+  const workspaceA = path.join(root, "workspace-a");
+  const workspaceB = path.join(root, "workspace-b");
+  const configPath = path.join(root, "private", ".env");
+  fs.mkdirSync(workspaceA, { recursive: true });
+  fs.mkdirSync(workspaceB, { recursive: true });
+  writePrivateFile(configPath, [
+    `PI_WORK_DIR=${workspaceA}`,
+    `PI_DATA_DIR=${path.dirname(configPath)}`,
+    "JWT_SECRET=legacy-private-jwt-secret-that-is-long-enough",
+    "PI_BOOTSTRAP_SECRET=legacy-private-bootstrap-secret-long-enough",
+    "PI_HOSTING_MODE=quick-tunnel",
+  ].join("\n"));
+
+  provisionWizardConfiguration({ configPath, workspace: workspaceA, hosting: { kind: "quick-tunnel" } });
+  const before = readConfigSnapshot(configPath, workspaceA);
+  const persisted = parseEnv(fs.readFileSync(configPath, "utf8"));
+  assert.equal(persisted.PI_INSTANCE_ID, before.instanceId);
+
+  persistEffectivePublicOrigin(configPath, "https://stable-test.trycloudflare.com/");
+  const publicSnapshot = readConfigSnapshot(configPath, workspaceA);
+  assert.equal(publicSnapshot.serverUrl, "https://stable-test.trycloudflare.com");
+  assert.notEqual(publicSnapshot.connectionFingerprint, before.connectionFingerprint);
+
+  provisionWizardConfiguration({
+    configPath,
+    workspace: workspaceB,
+    hosting: { kind: "custom-domain", publicUrl: publicSnapshot.serverUrl },
+  });
+  const changedWorkspace = readConfigSnapshot(configPath, workspaceB);
+  assert.equal(changedWorkspace.workspace, workspaceB);
+  assert.equal(changedWorkspace.instanceId, publicSnapshot.instanceId);
+  assert.equal(changedWorkspace.connectionFingerprint, publicSnapshot.connectionFingerprint);
+  assert.equal(changedWorkspace.connectionName, publicSnapshot.connectionName);
+  assert.equal(changedWorkspace.connectionDescription, publicSnapshot.connectionDescription);
 });

@@ -227,8 +227,7 @@ export async function readAdminStatus(
   try {
     const payload = await loopbackJson(port, "/admin/status", "GET", bootstrapSecret, timeoutMs);
     const activity = record(payload.activity);
-    const sessions = record(payload.sessions);
-    const activeSessions = numberValue(sessions.active) ?? numberValue(sessions.total) ?? 0;
+    const activeSessions = numberValue(activity.chatgptActiveSessions) ?? 0;
     return {
       online: true,
       chatGptConnected: activity.chatgptConnected === true,
