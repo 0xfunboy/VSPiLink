@@ -6,18 +6,16 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { AgentChatBroker, AgentChatStore } from "../dist/chat.js";
+import { resolveInstanceIdentity } from "../dist/instance-identity.js";
 import { createMcpServer } from "../dist/mcp.js";
 import { AgentTaskStore } from "../dist/tasks.js";
 
-const serverIdentity = Object.freeze({
+const canonicalIdentity = resolveInstanceIdentity({
   instanceId: "11111111-1111-4111-8111-111111111111",
   instanceLabel: "test-server",
-  instanceFingerprint: "1111111111",
-  connectionFingerprint: "2222222222",
-  connectionName: "VSPiLink — test-server · 2222222222",
-  connectionKey: "vspilink-test-server-2222222222",
-  serverUrl: "https://mcp.test.example",
+  publicUrl: "https://mcp.test.example",
 });
+const serverIdentity = Object.freeze({ ...canonicalIdentity, serverUrl: canonicalIdentity.publicOrigin });
 
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "pilink-tool-contract-"));
@@ -119,12 +117,15 @@ test("system guidance keeps agents in the autonomous collaboration pull loop", a
   assert.match(guidance, /stop merely because one task reached a terminal state/);
   assert.match(guidance, /Escalate to the user only for a genuine unresolved product decision/);
   assert.match(guidance, /concrete dependency, role, authorization, scope-conflict, or input reason/);
-  assert.match(guidance, /VSPiLink — test-server · 2222222222/);
+  assert.match(guidance, new RegExp(serverIdentity.connectionName.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")));
   assert.match(guidance, /Endpoint: https:\/\/mcp\.test\.example/);
+  assert.match(guidance, /Current workspace:/);
+  assert.doesNotMatch(guidance, /permanently bound to this endpoint and workspace/);
 
   const identity = await client.callTool({ name: "server_identity", arguments: {} });
   assert.notEqual(identity.isError, true);
   assert.equal(identity.structuredContent.connection_name, serverIdentity.connectionName);
+  assert.equal(identity.structuredContent.connection_description, serverIdentity.connectionDescription);
   assert.equal(identity.structuredContent.workspace, value.workspace);
   assert.equal(
     identity._meta["cc.eu.funboy.vspilink/instance"].connection_fingerprint,

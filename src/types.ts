@@ -1,3 +1,24 @@
+export type OAuthClientKind = "confidential" | "public";
+
+/**
+ * Non-secret target identity persisted with OAuth credentials. The binding is
+ * deliberately redundant: every field must still agree before a credential
+ * can be used, so changing an origin or copying a store fails closed.
+ */
+export interface OAuthBindingTarget {
+  binding_version: 1;
+  instance_id: string;
+  instance_fingerprint: string;
+  public_origin: string;
+  connection_key: string;
+  connection_fingerprint: string;
+  resource: string;
+}
+
+export interface OAuthCredentialBinding extends OAuthBindingTarget {
+  client_kind: OAuthClientKind;
+}
+
 export interface OAuthClient {
   client_id: string;
   client_secret_hash: string;
@@ -10,6 +31,8 @@ export interface OAuthClient {
   disabled_at?: string;
   secret_rotated_at?: string;
   token_version?: number;
+  /** Absent only on records created before instance-aware OAuth binding. */
+  binding?: OAuthCredentialBinding;
 }
 
 export interface AuthorizationCode {
@@ -46,8 +69,23 @@ export interface RefreshTokenRecord {
   created_at: string;
   expires_at: number;
   client_version?: number;
+  /** Absent only on records created before instance-aware OAuth binding. */
+  binding?: OAuthCredentialBinding;
 }
 
 export interface RefreshTokenStore {
   tokens: RefreshTokenRecord[];
+}
+
+/**
+ * Private, non-secret ownership marker for PI_DATA_DIR. The legacy target is
+ * immutable after creation and anchors one-time upgrades of pre-binding OAuth
+ * records, including across later public-origin changes.
+ */
+export interface OAuthDataDirectoryMetadata {
+  metadata_version: 1;
+  instance_id: string;
+  instance_fingerprint: string;
+  legacy_binding_target: OAuthBindingTarget;
+  created_at: string;
 }

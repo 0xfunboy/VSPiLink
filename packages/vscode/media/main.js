@@ -10,6 +10,9 @@
     "manageTrust",
     "connectChatGpt",
     "openChatGpt",
+    "reconnectChatGpt",
+    "revokeChatGpt",
+    "cancelChatGptSetup",
     "setupChat",
     "sendChat",
     "cancelChat",
@@ -84,6 +87,7 @@
       authorized: false,
       active: false,
       connected: false,
+      staleConnections: 0,
       activeSessions: 0,
     },
     collaboration: {
@@ -245,6 +249,7 @@
         authorized: externalMcp.authorized === true,
         active: externalMcp.active === true,
         connected: externalMcp.connected === true,
+        staleConnections: nonNegativeInteger(externalMcp.staleConnections),
         activeSessions: nonNegativeInteger(externalMcp.activeSessions),
       },
       collaboration: {
@@ -443,6 +448,13 @@
         configured: state.configured,
         trusted: state.trusted,
         workspace: state.workspace,
+        instanceId: state.instanceId,
+        instanceLabel: state.instanceLabel,
+        instanceFingerprint: state.instanceFingerprint,
+        connectionFingerprint: state.connectionFingerprint,
+        connectionName: state.connectionName,
+        connectionDescription: state.connectionDescription,
+        connectionKey: state.connectionKey,
         process: state.process,
         healthOnline: healthIsOnline(state.health),
         hostingMode: state.hostingMode,
@@ -942,6 +954,11 @@
         tone: "success",
         description: "OAuth is already authorized; no callback needs to be entered again",
       };
+      if (currentState.externalMcp.staleConnections > 0) return {
+        label: "New connection required",
+        tone: "warning",
+        description: "The saved ChatGPT connection belongs to a previous public origin and cannot be reused",
+      };
       if (currentState.externalMcp.configured) return {
         label: "Finish sign-in",
         tone: "progress",
@@ -994,7 +1011,13 @@
       ));
       return shell;
     }
+    const remoteDiagnosticError = errorMessage(currentState.error);
+    if (remoteDiagnosticError) {
+      shell.appendChild(renderConnectionIdentityCard(false));
+      shell.appendChild(renderInlineError(remoteDiagnosticError));
+    }
     if (!isRuntimeOnline()) {
+      if (!remoteDiagnosticError) shell.appendChild(renderConnectionIdentityCard(false));
       shell.appendChild(renderRemoteEmpty(
         "Start the MCP server",
         "Configuration exists, but the PiLink service is not running.",
@@ -1012,14 +1035,19 @@
       const registered = el("div", "remote-connected remote-connected--pending");
       const registeredCopy = el("div", "remote-connected__copy");
       append(registeredCopy,
-        el("strong", "remote-connected__title", "Authorize " + (currentState.connectionName || "this VSPiLink server")),
+        el("strong", "remote-connected__title", "Authorize " + currentState.connectionName),
         el("span", "remote-connected__description", "Setup opens once in your system browser because VS Code blocks OAuth popups. After approval, ChatGPT returns here automatically."),
         el("code", "connection-endpoint__url", (currentState.connectionFingerprint || "") + " · " + (currentState.mcpUrl || ""))
       );
       const registeredActions = el("div", "remote-connected__actions");
-      registeredActions.appendChild(makeButton("Authorize once in browser", "connectChatGpt", { variant: "primary", compact: true, icon: "↗" }));
+      append(registeredActions,
+        makeButton("Authorize once in browser", "connectChatGpt", { variant: "primary", compact: true, icon: "↗" }),
+        makeButton("Reconnect", "reconnectChatGpt", { variant: "secondary", compact: true, icon: "↻" }),
+        makeButton("Cancel setup", "cancelChatGptSetup", { variant: "ghost", compact: true })
+      );
       append(registered, registeredCopy, registeredActions);
       shell.appendChild(registered);
+      shell.appendChild(renderConnectionIdentityCard(false));
       return shell;
     }
 
@@ -1034,10 +1062,13 @@
     const actions = el("div", "remote-connected__actions");
     append(actions,
       makeButton("Open ChatGPT Chat", "openChatGpt", { variant: "primary", compact: true, icon: "↗" }),
-      makeButton("Open collaboration monitor", "openCollaborationMonitor", { variant: "secondary", compact: true, icon: ">_" })
+      makeButton("Reconnect", "reconnectChatGpt", { variant: "secondary", compact: true, icon: "↻" }),
+      makeButton("Revoke", "revokeChatGpt", { variant: "danger-subtle", compact: true, icon: "!" }),
+      makeButton("Open collaboration monitor", "openCollaborationMonitor", { variant: "ghost", compact: true, icon: ">_" })
     );
     append(connected, copy, actions);
     shell.appendChild(connected);
+    shell.appendChild(renderConnectionIdentityCard(false));
 
     const transcript = el("div", "transcript remote-transcript");
     transcript.setAttribute("role", "log");
@@ -1095,6 +1126,7 @@
       return makeChip(label, "success");
     }
     if (currentState.externalMcp.connected) return makeChip("OAuth ready", "success");
+    if (currentState.externalMcp.staleConnections > 0) return makeChip("Previous origin", "warning");
     if (currentState.externalMcp.configured) return makeChip("Client registered", "warning");
     if (isRuntimeOnline()) return makeChip("Not connected", "warning");
     return makeChip("Server stopped", "neutral");
@@ -1122,44 +1154,16 @@
     );
     guide.appendChild(intro);
 
-    const connectionIdentity = el("div", "connection-endpoint");
-    const connectionIdentityCopy = el("div", "connection-endpoint__copy");
-    append(
-      connectionIdentityCopy,
-      el("span", "connection-endpoint__label", "Create a separate app/connection with this exact name"),
-      el("code", "connection-endpoint__value", currentState.connectionName || "Not available")
-    );
-    const connectionIdentityActions = el("div", "connection-endpoint__actions");
-    connectionIdentityActions.appendChild(makeWizardButton("Copy name", "copyCredential", {
-      field: "connectionName", variant: "secondary", compact: true, icon: "⧉", disabled: !currentState.connectionName,
-    }));
-    append(connectionIdentity, connectionIdentityCopy, connectionIdentityActions);
-    guide.appendChild(connectionIdentity);
+    guide.appendChild(renderConnectionIdentityCard(true));
 
-    const connectionDescription = el("div", "connection-endpoint");
-    const connectionDescriptionCopy = el("div", "connection-endpoint__copy");
-    append(
-      connectionDescriptionCopy,
-      el("span", "connection-endpoint__label", "Description"),
-      el("code", "connection-endpoint__value", currentState.connectionDescription || "Not available")
-    );
-    const connectionDescriptionActions = el("div", "connection-endpoint__actions");
-    connectionDescriptionActions.appendChild(makeWizardButton("Copy description", "copyCredential", {
-      field: "connectionDescription", variant: "secondary", compact: true, icon: "⧉", disabled: !currentState.connectionDescription,
-    }));
-    append(connectionDescription, connectionDescriptionCopy, connectionDescriptionActions);
-    guide.appendChild(connectionDescription);
-
-    const endpoint = el("div", "connection-endpoint");
-    const endpointCopy = el("div", "connection-endpoint__copy");
-    append(endpointCopy, el("span", "connection-endpoint__label", "MCP endpoint"), el("code", "connection-endpoint__value", currentState.mcpUrl || "Not available"));
-    const endpointActions = el("div", "connection-endpoint__actions");
-    append(endpointActions,
-      makeButton("Copy", "copyMcpUrl", { variant: "secondary", compact: true, icon: "⧉", disabled: !currentState.mcpUrl }),
-      makeButton("Agent monitor", "openCollaborationMonitor", { variant: "ghost", compact: true, icon: ">_" })
-    );
-    append(endpoint, endpointCopy, endpointActions);
-    guide.appendChild(endpoint);
+    if (currentState.externalMcp.staleConnections > 0) {
+      const staleWarning = el("div", "connection-catalog-warning");
+      append(staleWarning,
+        el("strong", "connection-catalog-warning__title", "The public origin changed. Create a new ChatGPT connection."),
+        el("span", "connection-catalog-warning__text", "For safety, OAuth clients from the previous origin are inactive and cannot be repointed. Use the exact name and MCP URL shown above; you can remove the old ChatGPT entry separately.")
+      );
+      guide.appendChild(staleWarning);
+    }
 
     const catalogWarning = el("div", "connection-catalog-warning");
     append(catalogWarning,
@@ -1212,6 +1216,39 @@
       }
     }
     return guide;
+  }
+
+  function renderConnectionIdentityCard(copyable) {
+    const card = el("section", "connection-guide connection-identity-card");
+    card.setAttribute("aria-label", "Exact VSPiLink server identity");
+    const rows = [
+      ["Connection name", currentState.connectionName, "connectionName"],
+      ["Description", currentState.connectionDescription, "connectionDescription"],
+      ["Machine", currentState.instanceLabel + " · " + currentState.instanceFingerprint, ""],
+      ["Connection fingerprint", currentState.connectionFingerprint, ""],
+      ["HTTPS origin", currentState.publicUrl, ""],
+      ["MCP URL", currentState.mcpUrl, "mcpUrl"],
+      ["Current workspace", currentState.workspace, ""],
+    ];
+    rows.forEach(function (entry) {
+      const row = el("div", "connection-endpoint");
+      const copy = el("div", "connection-endpoint__copy");
+      append(copy,
+        el("span", "connection-endpoint__label", entry[0]),
+        el("code", "connection-endpoint__value", entry[1] || "Identity unavailable — refresh before continuing")
+      );
+      const actions = el("div", "connection-endpoint__actions");
+      if (copyable && entry[2] === "connectionName") {
+        actions.appendChild(makeWizardButton("Copy name", "copyCredential", { field: "connectionName", variant: "secondary", compact: true, icon: "⧉" }));
+      } else if (copyable && entry[2] === "connectionDescription") {
+        actions.appendChild(makeWizardButton("Copy description", "copyCredential", { field: "connectionDescription", variant: "secondary", compact: true, icon: "⧉" }));
+      } else if (copyable && entry[2] === "mcpUrl") {
+        actions.appendChild(makeButton("Copy MCP URL", "copyMcpUrl", { variant: "secondary", compact: true, icon: "⧉" }));
+      }
+      append(row, copy, actions);
+      card.appendChild(row);
+    });
+    return card;
   }
 
   function renderConnectionStep(number, title, description, complete, action) {

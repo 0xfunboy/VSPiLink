@@ -9,6 +9,7 @@ import {
   effectiveClientTokenVersion,
   findClient,
   findActiveClient,
+  isClientActive,
   verifyClientSecret,
   registerClient,
   createAuthorizationCode,
@@ -43,6 +44,7 @@ const CONSENT_REQUEST_TTL_MS = 10 * 60 * 1000;
 const MAX_CONSENT_REQUESTS = 128;
 const UNSAFE_OAUTH_DISPLAY_TEXT = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
 const limitPublicDcrRegistration = createRateLimiter(10, 60_000);
+let publicOpenAiDcrQueue: Promise<void> = Promise.resolve();
 const ALLOWED_PAIRING_CONTINUATIONS = new Set([
   "https://chatgpt.com/#settings/Security",
   "https://chatgpt.com/plugins",
@@ -53,7 +55,12 @@ function log(msg: string) {
   console.error(`[OAuth] ${msg.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/gu, " ").slice(0, 500)}`);
 }
 
-export function createOAuthRouter(): Router {
+export interface OAuthRouterOptions {
+  /** Immediately tear down live MCP transports after an administrative revoke. */
+  onClientDeleted?: (clientId: string) => void | Promise<void>;
+}
+
+export function createOAuthRouter(options: OAuthRouterOptions = {}): Router {
   const router = Router();
 
   // ── RFC 8414 & OpenID Metadata ────────────────────────────────
@@ -142,6 +149,7 @@ export function createOAuthRouter(): Router {
     }
     const clientId = Array.isArray(req.params.clientId) ? "" : req.params.clientId;
     const removed = await deleteClient(clientId);
+    if (removed) await options.onClientDeleted?.(clientId);
     res.status(removed ? 204 : 404).end();
   }));
 
@@ -227,8 +235,12 @@ export function createOAuthRouter(): Router {
       consentToken,
       resource || "",
       config.connectionName,
+      config.connectionDescription,
+      config.instanceLabel,
+      config.instanceFingerprint,
       config.connectionFingerprint,
       config.serverUrl,
+      config.workspace,
     );
     setConsentRedirectPolicy(res, redirect_uri || client.redirect_uris[0]);
     res.type("html").send(html);
@@ -616,31 +628,48 @@ export function createOAuthRouter(): Router {
       return;
     }
 
-    if (publicOpenAiDcr) {
-      const existing = reusablePublicOpenAiClient(resolvedRedirectUris[0]);
-      if (existing) {
-        res.status(201).json(publicClientRegistrationResponse(existing));
-        return;
-      }
-      const publicDcrClients = loadClients().filter((client) =>
-        client.disabled_at === undefined &&
-        client.token_endpoint_auth_method === "none" &&
-        client.redirect_uris.length === 1 &&
-        isPublicOpenAiRedirect(client.redirect_uris[0])
-      );
-      if (publicDcrClients.length >= 64) {
-        res.status(429).json({ error: "registration_limit_reached", error_description: "Too many pending OpenAI MCP clients" });
-        return;
-      }
-    }
+    const registration = publicOpenAiDcr
+      ? await serializePublicOpenAiDcr(async () => {
+          const existing = reusablePublicOpenAiClient(resolvedRedirectUris[0]);
+          if (existing) return { status: "reused" as const, client: existing };
+          const publicDcrClients = loadClients().filter((client) =>
+            isClientActive(client) &&
+            client.token_endpoint_auth_method === "none" &&
+            client.redirect_uris.length === 1 &&
+            isPublicOpenAiRedirect(client.redirect_uris[0])
+          );
+          if (publicDcrClients.length >= 64) return { status: "limited" as const };
+          return {
+            status: "created" as const,
+            ...(await registerClient(
+              client_name.trim(),
+              resolvedRedirectUris,
+              resolvedGrantTypes,
+              resolvedScope,
+              resolvedAuthMethod,
+            )),
+          };
+        })
+      : {
+          status: "created" as const,
+          ...(await registerClient(
+            client_name.trim(),
+            resolvedRedirectUris,
+            resolvedGrantTypes,
+            resolvedScope,
+            resolvedAuthMethod,
+          )),
+        };
 
-    const { client, client_secret } = await registerClient(
-      client_name.trim(),
-      resolvedRedirectUris,
-      resolvedGrantTypes,
-      resolvedScope,
-      resolvedAuthMethod,
-    );
+    if (registration.status === "limited") {
+      res.status(429).json({ error: "registration_limit_reached", error_description: "Too many pending OpenAI MCP clients" });
+      return;
+    }
+    if (registration.status === "reused") {
+      res.status(201).json(publicClientRegistrationResponse(registration.client));
+      return;
+    }
+    const { client, client_secret } = registration;
 
     log(`Client registered: ${maskClientId(client.client_id)}`);
     recordOAuthActivity(client.client_id, "registered");
@@ -714,13 +743,19 @@ function isPublicOpenAiRedirect(value: unknown): value is string {
 
 function reusablePublicOpenAiClient(redirectUri: string): OAuthClient | undefined {
   return loadClients().find((client) =>
-    client.disabled_at === undefined &&
+    isClientActive(client) &&
     client.token_endpoint_auth_method === "none" &&
     client.grant_types.includes("authorization_code") &&
     client.grant_types.includes("refresh_token") &&
     client.scope === "mcp:tools offline_access" &&
     client.redirect_uris.length === 1 && client.redirect_uris[0] === redirectUri
   );
+}
+
+function serializePublicOpenAiDcr<T>(operation: () => Promise<T>): Promise<T> {
+  const result = publicOpenAiDcrQueue.then(operation, operation);
+  publicOpenAiDcrQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 function publicClientRegistrationResponse(client: OAuthClient): Record<string, unknown> {
@@ -908,8 +943,8 @@ function renderPairingResult(paired: boolean): string {
 
 function renderPairingRequired(): string {
   return renderNoticePage(
-    "Confirm the request in VS Code",
-    "To protect this computer, open the VSPiLink wizard in VS Code and select “Authorize this browser”, then retry the connection in ChatGPT.",
+    "Pairing link unavailable",
+    "The one-use pairing link is missing, expired, or has already been used. Return to the VSPiLink wizard in VS Code and select Reconnect or Retry. VSPiLink will generate a new link and open it in your system browser. Complete pairing there; OAuth must not be opened in VS Code's integrated browser.",
     false,
   );
 }
@@ -930,8 +965,12 @@ function renderConsentPage(
   consentToken: string,
   resource: string,
   serverName: string,
-  serverFingerprint: string,
+  serverDescription: string,
+  instanceLabel: string,
+  instanceFingerprint: string,
+  connectionFingerprint: string,
   serverUrl: string,
+  workspace: string,
 ): string {
   const scopes = scope.split(" ").filter(Boolean);
   const scopeList = scopes.map((s) => `<li>${escapeHtml(s)}</li>`).join("\n");
@@ -961,6 +1000,7 @@ function renderConsentPage(
     .server-target { margin-bottom: 1.2rem; padding: 0.85rem 1rem; border: 1px solid rgba(142, 168, 255, 0.28); border-radius: 8px; background: rgba(142, 168, 255, 0.08); }
     .server-target span { display: block; color: #8888a0; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
     .server-target strong { display: block; margin-top: 0.25rem; color: #dfe5ff; }
+    .server-target p { margin-top: 0.35rem; color: #aeb8dc; font-size: 0.82rem; }
     .server-target code { display: block; margin-top: 0.35rem; color: #9eaadb; font-size: 0.76rem; overflow-wrap: anywhere; }
     .client-name {
       background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25);
@@ -985,7 +1025,7 @@ function renderConsentPage(
   <div class="card">
     <div class="logo">PI<span>-MCP</span></div>
     <p class="subtitle">Authorization Request (Pi Agent Harness)</p>
-    <div class="server-target"><span>Exact VSPiLink target</span><strong>${escapeHtml(serverName)}</strong><code>${escapeHtml(serverUrl)} · ${escapeHtml(serverFingerprint)}</code></div>
+    <div class="server-target"><span>Exact VSPiLink target</span><strong>${escapeHtml(serverName)}</strong><p>${escapeHtml(serverDescription)}</p><code>Machine: ${escapeHtml(instanceLabel)} · ${escapeHtml(instanceFingerprint)}</code><code>Connection: ${escapeHtml(connectionFingerprint)}</code><code>Origin: ${escapeHtml(serverUrl)}</code><code>Current workspace: ${escapeHtml(workspace)}</code></div>
     <div class="client-name">${escapeHtml(clientName)}</div>
     <h3>Requested Permissions</h3>
     <ul>${scopeList}</ul>

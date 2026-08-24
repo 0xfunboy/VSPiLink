@@ -9,7 +9,18 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import { v4 as uuidv4 } from "uuid";
 import type { Request, Response, NextFunction } from "express";
-import type { OAuthClient, AuthorizationCode, TokenPayload, ClientStore, RefreshTokenRecord, RefreshTokenStore } from "./types.js";
+import type {
+  OAuthClient,
+  AuthorizationCode,
+  TokenPayload,
+  ClientStore,
+  RefreshTokenRecord,
+  RefreshTokenStore,
+  OAuthBindingTarget,
+  OAuthClientKind,
+  OAuthCredentialBinding,
+  OAuthDataDirectoryMetadata,
+} from "./types.js";
 import { loadRuntimeConfig } from "./config.js";
 import {
   classifyPersistedRuntimeOwner,
@@ -24,6 +35,9 @@ const OAUTH_STATE_LOCK_TIMEOUT_MS = 5_000;
 const OAUTH_STATE_STALE_LOCK_MS = 30_000;
 const OAUTH_STATE_LOCK_RETRY_MS = 25;
 const CLIENT_ID_PATTERN = /^pi_[a-f0-9]{16}$/iu;
+const INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const FINGERPRINT_PATTERN = /^[a-f0-9]{10}$/u;
+const OAUTH_DATA_DIRECTORY_METADATA_FILE = "oauth-instance-binding.json";
 
 interface RevokedTokenRecord {
   jti: string;
@@ -68,23 +82,148 @@ function clientLifecycleAuditPath(): string {
   return path.join(loadRuntimeConfig().dataDir, "oauth-client-audit.jsonl");
 }
 
-function ensureDataDir(): void {
-  const dataDir = loadRuntimeConfig().dataDir;
+function oauthDataDirectoryMetadataPath(dataDir: string): string {
+  return path.join(dataDir, OAUTH_DATA_DIRECTORY_METADATA_FILE);
+}
+
+function ensureDataDir(): OAuthDataDirectoryMetadata {
+  const config = loadRuntimeConfig();
+  const dataDir = config.dataDir;
   if (!fs.existsSync(dataDir)) {
     fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   }
+  const stat = fs.statSync(dataDir);
+  if (!stat.isDirectory()) throw new Error("PI_DATA_DIR must be a private directory");
   fs.chmodSync(dataDir, 0o700);
+  const metadataPath = oauthDataDirectoryMetadataPath(dataDir);
+  const target = currentOAuthBindingTarget(config);
+  let metadata: OAuthDataDirectoryMetadata;
+  if (fs.existsSync(metadataPath)) {
+    metadata = parsePrivateJson<OAuthDataDirectoryMetadata>(
+      metadataPath,
+      "OAuth data-directory binding is malformed",
+    );
+  } else {
+    const candidate: OAuthDataDirectoryMetadata = {
+      metadata_version: 1,
+      instance_id: config.instanceId,
+      instance_fingerprint: config.instanceFingerprint,
+      legacy_binding_target: target,
+      created_at: new Date().toISOString(),
+    };
+    metadata = createOAuthDataDirectoryMetadata(metadataPath, candidate);
+  }
+  if (!isOAuthDataDirectoryMetadata(metadata)) {
+    throw new Error("OAuth data-directory binding is malformed");
+  }
+  if (
+    metadata.instance_id !== config.instanceId ||
+    metadata.instance_fingerprint !== config.instanceFingerprint
+  ) {
+    throw new Error("PI_DATA_DIR is already bound to another VSPiLink instance");
+  }
+  if (process.platform !== "win32") fs.chmodSync(metadataPath, 0o600);
+  return metadata;
+}
+
+function currentOAuthBindingTarget(config = loadRuntimeConfig()): OAuthBindingTarget {
+  return Object.freeze({
+    binding_version: 1,
+    instance_id: config.instanceId,
+    instance_fingerprint: config.instanceFingerprint,
+    public_origin: config.serverUrl,
+    connection_key: config.connectionKey,
+    connection_fingerprint: config.connectionFingerprint,
+    resource: config.serverUrl,
+  });
+}
+
+function clientKind(client: Pick<OAuthClient, "token_endpoint_auth_method">): OAuthClientKind {
+  return client.token_endpoint_auth_method === "none" ? "public" : "confidential";
+}
+
+function credentialBinding(
+  target: Readonly<OAuthBindingTarget>,
+  kind: OAuthClientKind,
+): OAuthCredentialBinding {
+  return Object.freeze({ ...target, client_kind: kind });
+}
+
+function createOAuthDataDirectoryMetadata(
+  metadataPath: string,
+  candidate: OAuthDataDirectoryMetadata,
+): OAuthDataDirectoryMetadata {
+  const temporaryPath = `${metadataPath}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(temporaryPath, "wx", 0o600);
+    fs.writeFileSync(descriptor, `${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    try {
+      // Publishing a completed hard link prevents another process from ever
+      // observing a partially written ownership marker.
+      fs.linkSync(temporaryPath, metadataPath);
+      return candidate;
+    } catch (error) {
+      if (!isNodeError(error, "EEXIST")) throw error;
+      return parsePrivateJson<OAuthDataDirectoryMetadata>(
+        metadataPath,
+        "OAuth data-directory binding is malformed",
+      );
+    }
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* best effort cleanup */ }
+    }
+    try { fs.rmSync(temporaryPath, { force: true }); } catch { /* best effort cleanup */ }
+  }
+}
+
+function isOAuthDataDirectoryMetadata(value: unknown): value is OAuthDataDirectoryMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const metadata = value as Partial<OAuthDataDirectoryMetadata>;
+  return metadata.metadata_version === 1 &&
+    typeof metadata.instance_id === "string" && INSTANCE_ID_PATTERN.test(metadata.instance_id) &&
+    typeof metadata.instance_fingerprint === "string" && FINGERPRINT_PATTERN.test(metadata.instance_fingerprint) &&
+    typeof metadata.created_at === "string" && metadata.created_at.length > 0 &&
+    isOAuthBindingTarget(metadata.legacy_binding_target) &&
+    metadata.legacy_binding_target.instance_id === metadata.instance_id &&
+    metadata.legacy_binding_target.instance_fingerprint === metadata.instance_fingerprint;
 }
 
 export function loadClients(): OAuthClient[] {
-  ensureDataDir();
+  const metadata = ensureDataDir();
   const clientsFile = clientStorePath();
   if (!fs.existsSync(clientsFile)) return [];
-  const data = parsePrivateJson<ClientStore>(clientsFile, "Client store is malformed");
+  const serialized = readPrivateJsonText(clientsFile, "Client store is malformed");
+  let data: ClientStore;
+  try {
+    data = JSON.parse(serialized) as ClientStore;
+  } catch {
+    throw new Error("Client store is malformed");
+  }
   if (!Array.isArray(data.clients) || data.clients.some((client) => !isStoredClient(client))) {
     throw new Error("Client store is malformed");
   }
-  return data.clients;
+  let migrated = false;
+  const clients = data.clients.map((client) => {
+    if (client.binding) return client;
+    migrated = true;
+    return {
+      ...client,
+      binding: credentialBinding(metadata.legacy_binding_target, clientKind(client)),
+    };
+  });
+  if (migrated) {
+    tryPersistLegacyOAuthMigration(
+      clientsFile,
+      serialized,
+      { clients } satisfies ClientStore,
+    );
+  }
+  return clients;
 }
 
 function saveClients(clients: OAuthClient[]): void {
@@ -94,12 +233,16 @@ function saveClients(clients: OAuthClient[]): void {
 
 function parsePrivateJson<T>(filePath: string, errorMessage: string): T {
   try {
-    const stat = fs.lstatSync(filePath);
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(errorMessage);
-    return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
+    return JSON.parse(readPrivateJsonText(filePath, errorMessage)) as T;
   } catch {
     throw new Error(errorMessage);
   }
+}
+
+function readPrivateJsonText(filePath: string, errorMessage: string): string {
+  const stat = fs.lstatSync(filePath);
+  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(errorMessage);
+  return fs.readFileSync(filePath, "utf8");
 }
 
 function writePrivateJsonAtomically(filePath: string, value: unknown): void {
@@ -136,18 +279,70 @@ function isStoredClient(value: unknown): value is OAuthClient {
     (client.disabled_at === undefined || typeof client.disabled_at === "string") &&
     (client.secret_rotated_at === undefined || typeof client.secret_rotated_at === "string") &&
     (client.token_version === undefined ||
-      (Number.isSafeInteger(client.token_version) && (client.token_version as number) > 0));
+      (Number.isSafeInteger(client.token_version) && (client.token_version as number) > 0)) &&
+    (client.binding === undefined || (
+      isOAuthCredentialBinding(client.binding) && client.binding.client_kind === clientKind(client)
+    ));
+}
+
+function isOAuthBindingTarget(value: unknown): value is OAuthBindingTarget {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const binding = value as Partial<OAuthBindingTarget>;
+  return binding.binding_version === 1 &&
+    typeof binding.instance_id === "string" && INSTANCE_ID_PATTERN.test(binding.instance_id) &&
+    typeof binding.instance_fingerprint === "string" && FINGERPRINT_PATTERN.test(binding.instance_fingerprint) &&
+    typeof binding.public_origin === "string" && isCanonicalHttpOrigin(binding.public_origin) &&
+    typeof binding.connection_key === "string" && binding.connection_key.length >= 12 && binding.connection_key.length <= 128 &&
+    typeof binding.connection_fingerprint === "string" && FINGERPRINT_PATTERN.test(binding.connection_fingerprint) &&
+    typeof binding.resource === "string" && binding.resource === binding.public_origin;
+}
+
+function isOAuthCredentialBinding(value: unknown): value is OAuthCredentialBinding {
+  if (!isOAuthBindingTarget(value)) return false;
+  const candidate = value as OAuthBindingTarget & { client_kind?: unknown };
+  return candidate.client_kind === "confidential" || candidate.client_kind === "public";
+}
+
+function isCanonicalHttpOrigin(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") &&
+      !url.username && !url.password && !url.search && !url.hash &&
+      (url.pathname === "/" || url.pathname === "") && url.origin === value;
+  } catch {
+    return false;
+  }
+}
+
+function sameOAuthBinding(
+  left: Readonly<OAuthCredentialBinding>,
+  right: Readonly<OAuthCredentialBinding>,
+): boolean {
+  return left.binding_version === right.binding_version &&
+    left.instance_id === right.instance_id &&
+    left.instance_fingerprint === right.instance_fingerprint &&
+    left.public_origin === right.public_origin &&
+    left.connection_key === right.connection_key &&
+    left.connection_fingerprint === right.connection_fingerprint &&
+    left.resource === right.resource &&
+    left.client_kind === right.client_kind;
+}
+
+export function isClientBoundToCurrentRuntime(client: OAuthClient): boolean {
+  try {
+    ensureDataDir();
+    if (!client.binding || !isOAuthCredentialBinding(client.binding)) return false;
+    const expected = credentialBinding(currentOAuthBindingTarget(), clientKind(client));
+    return sameOAuthBinding(client.binding, expected);
+  } catch {
+    return false;
+  }
 }
 
 async function withOAuthStateLock<T>(operation: () => Promise<T> | T): Promise<T> {
   ensureDataDir();
   const lockPath = oauthStateLockPath();
-  const owner: OAuthStateLockOwner = {
-    version: 1,
-    nonce: crypto.randomBytes(16).toString("hex"),
-    runtime: { ...LOCAL_RUNTIME_OWNER },
-  };
-  const serializedOwner = `${JSON.stringify(owner)}\n`;
+  const serializedOwner = serializeOAuthStateLockOwner();
   const deadline = Date.now() + OAUTH_STATE_LOCK_TIMEOUT_MS;
 
   while (true) {
@@ -178,6 +373,61 @@ async function withOAuthStateLock<T>(operation: () => Promise<T> | T): Promise<T
       if (await fs.promises.readFile(lockPath, "utf8") === serializedOwner) {
         await fs.promises.rm(lockPath, { force: true });
       }
+    } catch (error) {
+      if (!isNodeError(error, "ENOENT")) throw error;
+    }
+  }
+}
+
+function serializeOAuthStateLockOwner(): string {
+  const owner: OAuthStateLockOwner = {
+    version: 1,
+    nonce: crypto.randomBytes(16).toString("hex"),
+    runtime: { ...LOCAL_RUNTIME_OWNER },
+  };
+  return `${JSON.stringify(owner)}\n`;
+}
+
+/**
+ * Opportunistically persist a legacy binding without racing the server or a
+ * CLI mutation. If the shared OAuth lock is busy, callers still use the
+ * immutable data-directory legacy target in memory and the next mutation will
+ * persist it.
+ */
+function tryPersistLegacyOAuthMigration(
+  storePath: string,
+  originalSerialized: string,
+  migratedStore: unknown,
+): void {
+  const lockPath = oauthStateLockPath();
+  const serializedOwner = serializeOAuthStateLockOwner();
+  let descriptor: number | undefined;
+  try {
+    try {
+      descriptor = fs.openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (isNodeError(error, "EEXIST")) return;
+      throw error;
+    }
+    fs.writeFileSync(descriptor, serializedOwner, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    let current: string;
+    try {
+      current = readPrivateJsonText(storePath, "OAuth state changed during migration");
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) return;
+      throw error;
+    }
+    if (current !== originalSerialized) return;
+    writePrivateJsonAtomically(storePath, migratedStore);
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* best effort cleanup */ }
+    }
+    try {
+      if (fs.readFileSync(lockPath, "utf8") === serializedOwner) fs.rmSync(lockPath);
     } catch (error) {
       if (!isNodeError(error, "ENOENT")) throw error;
     }
@@ -255,7 +505,7 @@ export function effectiveClientTokenVersion(client: OAuthClient): number {
 }
 
 export function isClientActive(client: OAuthClient): boolean {
-  return client.disabled_at === undefined;
+  return client.disabled_at === undefined && isClientBoundToCurrentRuntime(client);
 }
 
 export async function deleteClient(clientId: string): Promise<boolean> {
@@ -298,12 +548,19 @@ export async function registerClient(
     scope,
     created_at: new Date().toISOString(),
     token_version: 1,
+    binding: credentialBinding(
+      currentOAuthBindingTarget(),
+      tokenEndpointAuthMethod === "none" ? "public" : "confidential",
+    ),
   };
 
   await withOAuthStateLock(() => {
     const clients = loadClients();
     if (clients.some((candidate) => candidate.client_id === client.client_id)) {
       throw new Error("Unable to allocate a unique OAuth client ID");
+    }
+    if (!isClientBoundToCurrentRuntime(client)) {
+      throw new Error("The OAuth target identity changed during client registration");
     }
     clients.push(client);
     saveClients(clients);
@@ -320,7 +577,7 @@ export async function setClientDisabled(clientId: string, disabled: boolean): Pr
     const index = clients.findIndex((client) => client.client_id === clientId);
     if (index < 0) return null;
     const current = clients[index];
-    if (disabled === !isClientActive(current)) return { ...current };
+    if (disabled === (current.disabled_at !== undefined)) return { ...current };
 
     let updated: OAuthClient;
     if (disabled) {
@@ -452,6 +709,9 @@ export function createAccessToken(
   client: OAuthClient,
   scope: string
 ): { access_token: string; expires_in: number; token_type: string } {
+  if (!isClientActive(client)) {
+    throw new Error("OAuth client is not bound to the current VSPiLink target");
+  }
   const config = loadRuntimeConfig();
   const payload: Omit<TokenPayload, "iat" | "exp"> = {
     sub: client.client_id,
@@ -479,6 +739,9 @@ export async function createRefreshToken(
   scope: string,
 ): Promise<{ refresh_token: string; expires_in: number }> {
   const config = loadRuntimeConfig();
+  if (!isClientActive(client) || !client.binding) {
+    throw new Error("OAuth client is not bound to the current VSPiLink target");
+  }
   const refreshToken = crypto.randomBytes(48).toString("base64url");
   const now = Date.now();
   const record: RefreshTokenRecord = {
@@ -488,11 +751,13 @@ export async function createRefreshToken(
     created_at: new Date(now).toISOString(),
     expires_at: now + config.refreshTokenExpirySeconds * 1000,
     client_version: effectiveClientTokenVersion(client),
+    binding: { ...client.binding },
   };
   await withOAuthStateLock(() => {
     const current = loadClients().find((candidate) => candidate.client_id === client.client_id);
     if (!current || !isClientActive(current) ||
-        effectiveClientTokenVersion(current) !== record.client_version) {
+        effectiveClientTokenVersion(current) !== record.client_version ||
+        !current.binding || !sameOAuthBinding(current.binding, record.binding!)) {
       throw new Error("OAuth client credentials changed");
     }
     const tokens = loadRefreshTokens().filter((candidate) => candidate.expires_at > now);
@@ -514,11 +779,13 @@ export async function rotateRefreshToken(
     const now = Date.now();
     const current = loadClients().find((candidate) => candidate.client_id === client.client_id);
     if (!current || !isClientActive(current) ||
+        !current.binding || !client.binding || !sameOAuthBinding(current.binding, client.binding) ||
         effectiveClientTokenVersion(current) !== effectiveClientTokenVersion(client)) return null;
     const tokens = loadRefreshTokens();
     const index = tokens.findIndex((candidate) => (
       candidate.client_id === client.client_id &&
       (candidate.client_version ?? 1) === effectiveClientTokenVersion(current) &&
+      Boolean(candidate.binding && sameOAuthBinding(candidate.binding, current.binding!)) &&
       candidate.expires_at > now &&
       safeHashEqual(candidate.token_hash, presentedHash)
     ));
@@ -535,6 +802,7 @@ export async function rotateRefreshToken(
       created_at: new Date(now).toISOString(),
       expires_at: now + config.refreshTokenExpirySeconds * 1000,
       client_version: effectiveClientTokenVersion(current),
+      binding: { ...current.binding },
     });
     saveRefreshTokens(tokens.filter((candidate) => candidate.expires_at > now).slice(-MAX_REFRESH_TOKENS));
     return {
@@ -546,10 +814,16 @@ export async function rotateRefreshToken(
 }
 
 function loadRefreshTokens(): RefreshTokenRecord[] {
-  ensureDataDir();
+  const metadata = ensureDataDir();
   const storePath = refreshTokenStorePath();
   if (!fs.existsSync(storePath)) return [];
-  const parsed = parsePrivateJson<RefreshTokenStore>(storePath, "Refresh token store is malformed");
+  const serialized = readPrivateJsonText(storePath, "Refresh token store is malformed");
+  let parsed: RefreshTokenStore;
+  try {
+    parsed = JSON.parse(serialized) as RefreshTokenStore;
+  } catch {
+    throw new Error("Refresh token store is malformed");
+  }
   if (!parsed || !Array.isArray(parsed.tokens)) throw new Error("Refresh token store is malformed");
   if (parsed.tokens.some((candidate) => !(
     candidate &&
@@ -559,9 +833,31 @@ function loadRefreshTokens(): RefreshTokenRecord[] {
     typeof candidate.created_at === "string" &&
     Number.isSafeInteger(candidate.expires_at) && candidate.expires_at > 0 &&
     (candidate.client_version === undefined ||
-      (Number.isSafeInteger(candidate.client_version) && candidate.client_version > 0))
+      (Number.isSafeInteger(candidate.client_version) && candidate.client_version > 0)) &&
+    (candidate.binding === undefined || isOAuthCredentialBinding(candidate.binding))
   ))) throw new Error("Refresh token store is malformed");
-  return parsed.tokens;
+  const clients = new Map(loadClients().map((client) => [client.client_id, client]));
+  let migrated = false;
+  const tokens = parsed.tokens.map((candidate) => {
+    if (candidate.binding) return candidate;
+    migrated = true;
+    const owner = clients.get(candidate.client_id);
+    return {
+      ...candidate,
+      binding: credentialBinding(
+        metadata.legacy_binding_target,
+        owner ? clientKind(owner) : "confidential",
+      ),
+    };
+  });
+  if (migrated) {
+    tryPersistLegacyOAuthMigration(
+      storePath,
+      serialized,
+      { tokens } satisfies RefreshTokenStore,
+    );
+  }
+  return tokens;
 }
 
 function saveRefreshTokens(tokens: RefreshTokenRecord[]): void {

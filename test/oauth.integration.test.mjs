@@ -499,6 +499,19 @@ test("public OpenAI DCR is opt-in, PKCE-only and restricted to ChatGPT callbacks
     "https://chatgpt.com/connector_platform_oauth_redirect",
   );
 
+  const parallelBody = {
+    ...registrationBody,
+    redirect_uris: ["https://chatgpt.com/connector/oauth/DcrParallel_123"],
+  };
+  const parallel = await Promise.all([0, 1].map(() => fetch(`${serverUrl}/oauth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(parallelBody),
+  })));
+  assert.deepEqual(parallel.map((response) => response.status), [201, 201]);
+  const parallelClients = await Promise.all(parallel.map((response) => response.json()));
+  assert.equal(parallelClients[0].client_id, parallelClients[1].client_id);
+
   for (const invalidBody of [
     { ...registrationBody, redirect_uris: ["https://attacker.example/oauth/callback"] },
     { ...registrationBody, redirect_uris: ["https://chatgpt.com.evil.example/connector/oauth/test123"] },
@@ -590,7 +603,16 @@ test("paired consent requires a one-use owner session and protects the local adm
     code_challenge: challenge,
     code_challenge_method: "S256",
   }).toString();
-  assert.equal((await fetch(authorization)).status, 403);
+  const missingPairing = await fetch(authorization);
+  assert.equal(missingPairing.status, 403);
+  const missingPairingPage = await missingPairing.text();
+  assert.match(missingPairingPage, /Pairing link unavailable/u);
+  assert.match(missingPairingPage, /one-use pairing link is missing, expired, or has already been used/u);
+  assert.match(missingPairingPage, /Reconnect or Retry/u);
+  assert.match(missingPairingPage, /system browser/u);
+  assert.match(missingPairingPage, /must not be opened in VS Code&#039;s integrated browser/u);
+  assert.doesNotMatch(missingPairingPage, /Confirm the request in VS Code/u);
+  assert.doesNotMatch(missingPairingPage, /Authorize this browser/u);
 
   const pairingResponse = await fetch(`${serverUrl}/admin/oauth/pairing`, {
     method: "POST",

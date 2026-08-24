@@ -686,10 +686,15 @@ function printNipIoStartupInstructions(serverUrl: string, automaticMappings: boo
 
 async function runFirstTimeSetup(serverUrl: string, forceSetup: boolean): Promise<void> {
   try {
+    // The edge origin is discovered after the child server starts. Pin the
+    // setup-side OAuth store to that same effective origin before reading or
+    // registering clients; otherwise a Quick Tunnel client is accidentally
+    // bound to the loopback fallback and is unusable immediately.
+    process.env.SERVER_URL = serverUrl;
     loadEnvironment();
     const runtimeConfig = loadRuntimeConfig();
     const clients = loadClients();
-    if (!forceSetup && clients.length > 0) {
+    if (!forceSetup && clients.some((client) => isClientActive(client))) {
       console.error("An OAuth client is already configured. Use 'pilink start --setup' to register another client.");
       return;
     }

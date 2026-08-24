@@ -75,6 +75,21 @@
         "icon": "$(globe)"
       },
       {
+        "command": "vspilink.reconnectChatGpt",
+        "title": "Reconnect ChatGPT OAuth",
+        "category": "VSPiLink"
+      },
+      {
+        "command": "vspilink.revokeChatGpt",
+        "title": "Revoke ChatGPT OAuth",
+        "category": "VSPiLink"
+      },
+      {
+        "command": "vspilink.cancelChatGptSetup",
+        "title": "Cancel Pending ChatGPT Setup",
+        "category": "VSPiLink"
+      },
+      {
         "command": "vspilink.initialize",
         "title": "Initialize the Workspace",
         "category": "VSPiLink"

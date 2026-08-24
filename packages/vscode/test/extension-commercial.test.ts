@@ -84,17 +84,14 @@ test("ChatGPT MCP setup uses the system browser once and daily chat stays in VS 
   assert.doesNotMatch(pairing, /openIntegratedBrowser\(/);
   assert.match(pairing, /After approval, ChatGPT returns inside VS Code automatically/);
 
-  const storage = methodSource("requirePersistentBrowserStorage");
-  assert.match(storage, /storage !== "ephemeral"/);
-  assert.match(storage, /workbench\.browser\.dataStorage/);
-
   const state = methodSource("dashboardState");
-  assert.match(state, /chatGptAuthorized && this\.returnToIntegratedChatAfterOAuth/);
-  assert.match(state, /this\.returnToIntegratedChatAfterOAuth = false/);
+  assert.match(state, /this\.oauthHandoff\.consume/);
+  assert.match(state, /handoff\.status === "consumed"/);
   assert.match(state, /void this\.openChatGpt\("chat"\)\.catch/);
 
   assert.match(pairing, /destination === "plugins"/);
-  assert.match(pairing, /this\.returnToIntegratedChatAfterOAuth = true/);
+  assert.match(pairing, /this\.oauthHandoff\.begin/);
+  assert.match(pairing, /this\.oauthHandoff\.clear/);
 
   const monitor = methodSource("openCollaborationMonitor");
   assert.match(monitor, /shellArgs: \[cliPath, "chat"\]/);
@@ -104,25 +101,93 @@ test("ChatGPT MCP setup uses the system browser once and daily chat stays in VS 
   assert.doesNotMatch(monitor, /configureAgents|setupChat/);
 });
 
-test("external OAuth deep links are routed through the configured server and integrated browser", () => {
+test("legacy OAuth deep links cannot route ChatGPT OAuth into the integrated browser", () => {
   const registration = methodSource("registerUriHandler");
   assert.match(registration, /registerUriHandler/);
   assert.match(registration, /handleExternalUri/);
 
   const handler = methodSource("handleExternalUri");
   assert.match(handler, /uri\.path !== "\/open-oauth"/);
-  assert.match(handler, /externalUriTarget\(uri\.query\)/);
-  assert.match(handler, /validateExternalOAuthUrl/);
-  assert.match(handler, /requirePersistentBrowserStorage/);
-  assert.match(handler, /openOAuthInVsCode/);
+  assert.match(handler, /route is retired/);
+  assert.doesNotMatch(handler, /workbench\.action\.browser\.open|simpleBrowser|openExternal/);
+  assert.doesNotMatch(source, /private async openOAuthInVsCode/);
+});
 
-  const oauthBrowser = methodSource("openOAuthInVsCode");
-  assert.match(oauthBrowser, /workbench\.action\.browser\.open/);
-  assert.match(oauthBrowser, /simpleBrowser\.api\.open/);
-  assert.doesNotMatch(oauthBrowser, /vscode\.env\.openExternal/);
+test("Cloudflare first run provisions a verified private helper before browser login", () => {
+  assert.match(source, /from "\.\/cloudflared-bootstrap\.js"/);
 
-  assert.match(source, /target\.origin !== expected\.origin/);
-  assert.match(source, /target\.pathname !== "\/oauth\/authorize"/);
-  assert.match(source, /target\.pathname !== "\/oauth\/pair"/);
-  assert.match(source, /query\.slice\(4\)/);
+  const ensure = methodSource("ensureCloudflaredExecutable");
+  assert.match(ensure, /path\.dirname\(snapshot\.configPath\), "bin", "cloudflared"/);
+  assert.match(ensure, /provisionManagedCloudflared\(/);
+  assert.match(ensure, /MANAGED_CLOUDFLARED_VERSION/);
+  assert.match(ensure, /PI_CLOUDFLARED_PATH/);
+  assert.match(ensure, /writePrivateFile\(/);
+
+  const login = methodSource("loginCloudflareCredential");
+  assert.match(login, /this\.snapshot\(workspace\)/);
+  assert.match(login, /await this\.ensureCloudflaredExecutable\(snapshot\)/);
+  assert.ok(login.indexOf("ensureCloudflaredExecutable") < login.indexOf("return await loginCloudflare"));
+
+  const named = methodSource("runNamedHostingCli");
+  assert.match(named, /await this\.ensureCloudflaredExecutable\(snapshot, command !== "status"\)/);
+});
+
+test("ChatGPT setup is gated by the exact final server identity", () => {
+  const connect = methodSource("connectChatGpt");
+  assert.match(connect, /snapshot = await this\.synchronizeQuickTunnelIdentity\(snapshot\)/);
+  assert.match(connect, /snapshot = this\.snapshot\(snapshot\.workspace\)/);
+  assert.match(connect, /state\.connectionKey !== snapshot\.connectionKey/);
+  assert.match(connect, /state\.connectionFingerprint !== snapshot\.connectionFingerprint/);
+  assert.match(connect, /confirmChatGptTarget\(snapshot, state\.publicUrl, state\.mcpUrl\)/);
+  assert.ok(connect.indexOf("confirmChatGptTarget") < connect.indexOf("if (state.externalMcp.configured)"));
+
+  const dashboard = methodSource("dashboardState");
+  assert.doesNotMatch(dashboard, /capturedPublicUrl/);
+
+  const synchronize = methodSource("synchronizeQuickTunnelIdentity");
+  assert.match(synchronize, /readAdminStatus\(snapshot\.port, snapshot\.bootstrapSecret/);
+  assert.match(synchronize, /resolveQuickTunnelRuntimeIdentity/);
+  assert.match(synchronize, /persistEffectivePublicOrigin/);
+  assert.match(synchronize, /await this\.attestWizardEndpoint\(refreshed, resolved\.origin\)/);
+
+  for (const lifecycle of [methodSource("startConfigured"), methodSource("restartConfigured")]) {
+    assert.match(lifecycle, /snapshot = await this\.synchronizeQuickTunnelIdentity\(snapshot\)/);
+  }
+
+  const confirmation = methodSource("confirmChatGptTarget");
+  for (const field of [
+    "snapshot.connectionName",
+    "snapshot.connectionDescription",
+    "snapshot.instanceLabel",
+    "snapshot.instanceFingerprint",
+    "snapshot.connectionFingerprint",
+    "publicUrl",
+    "mcpUrl",
+    "snapshot.workspace",
+  ]) assert.match(confirmation, new RegExp(field.replaceAll(".", "\\."), "u"));
+  assert.match(confirmation, /Continue to ChatGPT/);
+});
+
+test("guided Full access stays disabled until one exact stable-origin client is authorized", () => {
+  const provision = methodSource("provisionWizard");
+  assert.match(provision, /accessMode === "full" && hosting\.kind === "quick-tunnel"/);
+  assert.match(provision, /removeEnvValue\(contents, "PI_FULL_ACCESS_CLIENT_IDS"\)/);
+  assert.match(provision, /updateEnvValue\(contents, "PI_REQUIRE_EXECUTION_APPROVAL", "true"\)/);
+
+  const start = methodSource("startWizardRuntime");
+  assert.match(start, /const args = \[plan\.command\]/);
+  assert.doesNotMatch(start, /allow-unsafe-full-access/);
+
+  const binding = methodSource("ensureWizardFullAccessBinding");
+  assert.match(binding, /selectPendingFullAccessClient\(/);
+  assert.match(binding, /accessMode: wizard\.accessMode/);
+  assert.match(binding, /publicOrigin: snapshot\.serverUrl/);
+  assert.match(binding, /selection\.status === "ambiguous"/);
+  assert.match(binding, /PI_REQUIRE_EXECUTION_APPROVAL === "true"/);
+
+  const activation = methodSource("applyFullAccessClient");
+  assert.match(activation, /writeFullAccessConfiguration\(snapshot, clientId, true\)/);
+  assert.match(activation, /hosting\.kind === "quick-tunnel"/);
+  assert.match(activation, /restartManagedChatServer/);
+  assert.match(activation, /waitForHealth/);
 });

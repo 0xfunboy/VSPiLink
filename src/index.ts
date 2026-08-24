@@ -45,6 +45,7 @@ const MCP_SERVER_IDENTITY = Object.freeze({
   instanceFingerprint: config.instanceFingerprint,
   connectionFingerprint: config.connectionFingerprint,
   connectionName: config.connectionName,
+  connectionDescription: config.connectionDescription,
   connectionKey: config.connectionKey,
   serverUrl: config.serverUrl,
 });
@@ -238,7 +239,7 @@ app.use((req, res, next) => {
 });
 
 // ── Mount OAuth routes (public, no Bearer required) ──────────
-const oauthRouter = createOAuthRouter();
+const oauthRouter = createOAuthRouter({ onClientDeleted: closeClientTransports });
 app.use(["/oauth/token", "/oauth/register", "/oauth/authorize", "/oauth/pair", "/admin/oauth/pairing", "/admin/oauth/clients"], createRateLimiter(20, 60_000));
 app.use(oauthRouter);
 app.use(["/admin/status", "/admin/agents", "/admin/collaboration"], createRateLimiter(120, 60_000));
@@ -264,6 +265,7 @@ app.get("/health", (req, res) => {
       fingerprint: config.instanceFingerprint,
       connection_fingerprint: config.connectionFingerprint,
       connection_name: config.connectionName,
+      connection_description: config.connectionDescription,
     },
     // Keep the legacy health payload for existing browser-mode installs, while
     // new paired installs expose operational counters only on /admin/status.
@@ -284,6 +286,7 @@ app.get("/.well-known/vspilink-instance", (_req, res) => {
     instance_fingerprint: config.instanceFingerprint,
     connection_fingerprint: config.connectionFingerprint,
     display_name: config.connectionName,
+    description: config.connectionDescription,
     connection_key: config.connectionKey,
     server_url: SERVER_URL,
     mcp_url: `${SERVER_URL}/sse`,
@@ -308,6 +311,7 @@ app.get("/admin/status", requireLocalAdmin, (_req, res) => {
       fingerprint: config.instanceFingerprint,
       connection_fingerprint: config.connectionFingerprint,
       connection_name: config.connectionName,
+      connection_description: config.connectionDescription,
       connection_key: config.connectionKey,
     },
     sessions: publicSessionStatus(),
@@ -826,6 +830,21 @@ function activeSessionsForClient(clientId: string): number {
   return Object.values(transports).filter((managed) => managed.clientId === clientId).length;
 }
 
+function isChatGptOAuthClient(clientId: string): boolean {
+  const client = findClient(clientId);
+  if (!client || !client.grant_types.includes("authorization_code")) return false;
+  return client.redirect_uris.some((value) => {
+    try {
+      const url = new URL(value);
+      const hostname = url.hostname.toLowerCase();
+      return url.protocol === "https:" && !url.username && !url.password && !url.hash &&
+        (hostname === "chatgpt.com" || hostname === "www.chatgpt.com" || hostname === "chat.openai.com");
+    } catch {
+      return false;
+    }
+  });
+}
+
 function publicSessionStatus() {
   const active = Object.values(transports);
   return {
@@ -1138,7 +1157,11 @@ function removeManagedTransport(
   const managed = transports[sessionId];
   if (!managed || (expected && managed.transport !== expected)) return undefined;
   delete transports[sessionId];
-  setActiveMcpSessions(managed.clientId, activeSessionsForClient(managed.clientId));
+  setActiveMcpSessions(
+    managed.clientId,
+    activeSessionsForClient(managed.clientId),
+    isChatGptOAuthClient(managed.clientId),
+  );
   return managed;
 }
 
@@ -1155,6 +1178,16 @@ async function closeManagedTransport(sessionId: string, managed: ManagedTranspor
   const detached = removeManagedTransport(sessionId, managed.transport);
   if (!detached) return;
   await closeDetachedTransport(sessionId, detached, context);
+}
+
+async function closeClientTransports(clientId: string): Promise<void> {
+  const owned = Object.entries(transports).filter(([, managed]) => managed.clientId === clientId);
+  await Promise.all(owned.map(([sessionId, managed]) => closeManagedTransport(
+    sessionId,
+    managed,
+    "OAuth revoke",
+  )));
+  setActiveMcpSessions(clientId, 0, isChatGptOAuthClient(clientId));
 }
 
 function isReclaimable(managed: ManagedTransport, now: number): boolean {
@@ -1324,7 +1357,7 @@ app.post("/sse", authenticateBearer, asyncRoute(async (req, res) => {
         console.error("[MCP] Streamable HTTP session created.");
         if (managed) {
           transports[sid] = managed;
-          setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub));
+          setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub), isChatGptOAuthClient(client.sub));
           releaseReservation();
         }
       },
@@ -1361,7 +1394,7 @@ app.post("/sse", authenticateBearer, asyncRoute(async (req, res) => {
     try {
       await mcpServer.connect(transport);
       await withManagedRequest(managed, () => transport.handleRequest(req, res, req.body));
-      recordMcpInitialized(client.sub);
+      recordMcpInitialized(client.sub, isChatGptOAuthClient(client.sub));
       notifyParentOfMcpConnection();
     } catch (error) {
       cleanup();
@@ -1444,7 +1477,7 @@ app.get("/sse", authenticateBearer, asyncRoute(async (req, res) => {
   );
   managed.openStreams = 1;
   transports[transport.sessionId] = managed;
-  setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub));
+  setActiveMcpSessions(client.sub, activeSessionsForClient(client.sub), isChatGptOAuthClient(client.sub));
   releaseReservation();
   console.error("[MCP] Legacy SSE session created.");
 
@@ -1521,7 +1554,7 @@ app.post("/messages", authenticateBearer, asyncRoute(async (req, res) => {
   try {
     await withManagedRequest(managed, () => transport.handlePostMessage(req, res, req.body));
     managed.established = true;
-    recordMcpInitialized(managed.clientId);
+    recordMcpInitialized(managed.clientId, isChatGptOAuthClient(managed.clientId));
     notifyParentOfMcpConnection();
   } catch (error) {
     console.error("[MCP] Error handling legacy SSE message:", error);

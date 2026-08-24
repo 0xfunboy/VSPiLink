@@ -94,7 +94,15 @@ test("the primary onboarding creates one normal-Chat connection per server", () 
   assert.doesNotMatch(guide, /not available in normal Chat/);
   assert.doesNotMatch(guide, /destination: "work"/);
   assert.match(guide, /destination: "plugins"/);
-  assert.match(guide, /connectionDescription/);
+  assert.match(guide, /renderConnectionIdentityCard\(true\)/);
+  const identity = functionSource("renderConnectionIdentityCard");
+  assert.match(identity, /connectionName/);
+  assert.match(identity, /connectionDescription/);
+  assert.match(identity, /instanceLabel.*instanceFingerprint/);
+  assert.match(identity, /connectionFingerprint/);
+  assert.match(identity, /publicUrl/);
+  assert.match(identity, /mcpUrl/);
+  assert.match(identity, /workspace/);
   const oauth = functionSource("renderCallbackStep");
   assert.match(oauth, /Dynamic Client Registration \(DCR\)/);
   assert.match(oauth, /you do not need to find or copy it/);

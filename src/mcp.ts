@@ -69,6 +69,7 @@ import {
   memoryQueryToolInputSchema,
 } from "./memory-mcp.js";
 import { sanitizeExecutionSpawnContext } from "./execution-environment.js";
+import { resolveInstanceIdentity } from "./instance-identity.js";
 
 export interface McpAgentServices {
   manager: AgentManager;
@@ -140,6 +141,7 @@ export interface McpServerIdentity {
   instanceFingerprint: string;
   connectionFingerprint: string;
   connectionName: string;
+  connectionDescription: string;
   connectionKey: string;
   serverUrl: string;
 }
@@ -230,7 +232,7 @@ export function createMcpServer(
           name: targetIdentity.connectionKey,
           title: targetIdentity.connectionName,
           version: VERSION,
-          description: `VSPiLink MCP bridge for ${targetIdentity.instanceLabel} (${targetIdentity.connectionFingerprint})`,
+          description: targetIdentity.connectionDescription,
         }
       : { name: "pilink", title: "VSPiLink", version: VERSION },
     { instructions: initialSystemPromptText },
@@ -256,6 +258,7 @@ export function createMcpServer(
           instance_fingerprint: targetIdentity.instanceFingerprint,
           connection_fingerprint: targetIdentity.connectionFingerprint,
           connection_name: targetIdentity.connectionName,
+          connection_description: targetIdentity.connectionDescription,
           server_url: targetIdentity.serverUrl,
         },
       },
@@ -321,7 +324,7 @@ export function createMcpServer(
     try {
       const result = await server.server.elicitInput({
         mode: "form",
-        message: `${label} requests execution approval.${targetIdentity ? `\n\nTarget: ${targetIdentity.connectionName}\nEndpoint: ${targetIdentity.serverUrl}\nWorkspace: ${policy.workspace}` : ""}\n\n${detail}\n\nApprove only if you understand that this code runs as the PiLink operating-system user and may affect files, processes, or network resources.`,
+        message: `${label} requests execution approval.${targetIdentity ? `\n\nConnection: ${targetIdentity.connectionName}\nDescription: ${targetIdentity.connectionDescription}\nMachine: ${targetIdentity.instanceLabel} · ${targetIdentity.instanceFingerprint}\nConnection fingerprint: ${targetIdentity.connectionFingerprint}\nOrigin: ${targetIdentity.serverUrl}\nMCP URL: ${targetIdentity.serverUrl}/sse\nCurrent workspace: ${policy.workspace}` : ""}\n\n${detail}\n\nApprove only if you understand that this code runs as the PiLink operating-system user and may affect files, processes, or network resources.`,
         requestedSchema: {
           type: "object",
           properties: {
@@ -500,13 +503,14 @@ export function createMcpServer(
       instance_fingerprint: z.string(),
       connection_fingerprint: z.string(),
       connection_name: z.string(),
+      connection_description: z.string(),
       connection_key: z.string(),
       server_url: z.string(),
       workspace: z.string(),
     }).strict();
     server.registerTool("server_identity", {
       title: "Verify VSPiLink Server Identity",
-      description: "Return the exact VSPiLink machine, public endpoint, fingerprint, and workspace bound to this connection. Use it before side effects when more than one VSPiLink server is available.",
+      description: "Return the exact VSPiLink machine, public endpoint, connection fingerprint, and current workspace. Use it before side effects when more than one VSPiLink server is available.",
       inputSchema: z.object({}).strict(),
       outputSchema: serverIdentityResultSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -517,6 +521,7 @@ export function createMcpServer(
         instance_fingerprint: targetIdentity.instanceFingerprint,
         connection_fingerprint: targetIdentity.connectionFingerprint,
         connection_name: targetIdentity.connectionName,
+        connection_description: targetIdentity.connectionDescription,
         connection_key: targetIdentity.connectionKey,
         server_url: targetIdentity.serverUrl,
         workspace: policy.workspace,
@@ -1663,7 +1668,7 @@ function buildSystemPrompt(
         ? "Role bootstrap is unavailable on this MCP session because project content or another project tool was accessed first. Continue with generic actor-scoped collaboration behavior. Create a new MCP session to obtain a verified role assignment."
         : undefined;
   const targetGuidance = serverIdentity
-    ? `VSPILINK SERVER TARGET\nConnection: ${serverIdentity.connectionName}\nInstance fingerprint: ${serverIdentity.instanceFingerprint}\nConnection fingerprint: ${serverIdentity.connectionFingerprint}\nEndpoint: ${serverIdentity.serverUrl}\nWorkspace: ${policy.workspace}\nThis connection is permanently bound to this endpoint and workspace. Never claim that a tool call ran on another server. If the user names a different machine, use that machine's separate VSPiLink connection instead of routing or guessing.`
+    ? `VSPILINK SERVER TARGET\nConnection: ${serverIdentity.connectionName}\nDescription: ${serverIdentity.connectionDescription}\nInstance fingerprint: ${serverIdentity.instanceFingerprint}\nConnection fingerprint: ${serverIdentity.connectionFingerprint}\nEndpoint: ${serverIdentity.serverUrl}\nCurrent workspace: ${policy.workspace}\nThis connection is permanently bound to this server installation and public origin. The current workspace is mutable configuration and is shown separately above. Never claim that a tool call ran on another server. If the user names a different machine, use that machine's separate VSPiLink connection instead of routing or guessing.`
     : "VSPILINK SERVER TARGET\nLegacy unnamed connection. Verify the configured workspace before side effects.";
 
   const basePrompt = `${targetGuidance}\n\nYou are an expert coding assistant using the PiLink tool harness.
@@ -1724,24 +1729,34 @@ function normalizeMcpServerIdentity(value: Readonly<McpServerIdentity>): Readonl
     throw new Error("serverIdentity fingerprints must be lowercase hexadecimal");
   }
   const connectionName = safeText(value.connectionName, "connectionName", 160);
+  const connectionDescription = safeText(value.connectionDescription, "connectionDescription", 500);
   const connectionKey = safeText(value.connectionKey, "connectionKey", 63);
   if (!/^[a-z0-9][a-z0-9-]*$/u.test(connectionKey)) throw new Error("serverIdentity.connectionKey is invalid");
   let serverUrl: string;
   try {
     const parsed = new URL(value.serverUrl);
     if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new Error();
-    serverUrl = parsed.toString().replace(/\/$/u, "");
+    serverUrl = parsed.origin;
   } catch {
     throw new Error("serverIdentity.serverUrl must be an absolute HTTP(S) URL");
   }
+  const canonical = resolveInstanceIdentity({ instanceId, instanceLabel, publicUrl: serverUrl });
+  if (
+    canonical.instanceFingerprint !== instanceFingerprint ||
+    canonical.connectionFingerprint !== connectionFingerprint ||
+    canonical.connectionName !== connectionName ||
+    canonical.connectionDescription !== connectionDescription ||
+    canonical.connectionKey !== connectionKey
+  ) throw new Error("serverIdentity derived fields do not match its instance and public origin");
   return Object.freeze({
-    instanceId,
-    instanceLabel,
-    instanceFingerprint,
-    connectionFingerprint,
-    connectionName,
-    connectionKey,
-    serverUrl,
+    instanceId: canonical.instanceId,
+    instanceLabel: canonical.instanceLabel,
+    instanceFingerprint: canonical.instanceFingerprint,
+    connectionFingerprint: canonical.connectionFingerprint,
+    connectionName: canonical.connectionName,
+    connectionDescription: canonical.connectionDescription,
+    connectionKey: canonical.connectionKey,
+    serverUrl: canonical.publicOrigin,
   });
 }
 

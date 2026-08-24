@@ -8,6 +8,8 @@ export interface ClientActivity {
   refreshedAt?: string;
   mcpInitializedAt?: string;
   activeMcpSessions: number;
+  /** True only for an OAuth client registered with a ChatGPT redirect URI. */
+  chatGpt?: boolean;
 }
 
 const clients = new Map<string, ClientActivity>();
@@ -23,23 +25,35 @@ export function recordOAuthActivity(clientId: string, kind: OAuthActivityKind): 
   if (kind === "refresh") activity.refreshedAt = now;
 }
 
-export function recordMcpInitialized(clientId: string): void {
+export function recordMcpInitialized(clientId: string, chatGpt = false): void {
   if (!validClientId(clientId)) return;
-  activityFor(clientId).mcpInitializedAt = new Date().toISOString();
+  const activity = activityFor(clientId);
+  activity.mcpInitializedAt = new Date().toISOString();
+  if (chatGpt) activity.chatGpt = true;
 }
 
-export function setActiveMcpSessions(clientId: string, count: number): void {
+export function setActiveMcpSessions(clientId: string, count: number, chatGpt = false): void {
   if (!validClientId(clientId)) return;
-  activityFor(clientId).activeMcpSessions = Math.max(0, Math.floor(count));
+  const activity = activityFor(clientId);
+  activity.activeMcpSessions = Math.max(0, Math.floor(count));
+  if (chatGpt) activity.chatGpt = true;
 }
 
-export function serviceActivitySnapshot(): { clients: ClientActivity[]; chatgptConnected: boolean } {
+export function serviceActivitySnapshot(): {
+  clients: ClientActivity[];
+  chatgptConnected: boolean;
+  chatgptActiveSessions: number;
+} {
   const snapshot = [...clients.values()]
     .map((activity) => ({ ...activity, clientId: maskClientId(activity.clientId) }))
     .sort((left, right) => lastTimestamp(right).localeCompare(lastTimestamp(left)));
   return {
     clients: snapshot,
-    chatgptConnected: snapshot.some((activity) => Boolean(activity.mcpInitializedAt)),
+    chatgptConnected: snapshot.some((activity) => activity.chatGpt === true && activity.activeMcpSessions > 0),
+    chatgptActiveSessions: snapshot.reduce(
+      (total, activity) => total + (activity.chatGpt === true ? activity.activeMcpSessions : 0),
+      0,
+    ),
   };
 }
 

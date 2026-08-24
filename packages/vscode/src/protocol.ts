@@ -10,6 +10,9 @@ export const WEBVIEW_COMMANDS = [
   "manageTrust",
   "connectChatGpt",
   "openChatGpt",
+  "reconnectChatGpt",
+  "revokeChatGpt",
+  "cancelChatGptSetup",
   "setupChat",
   "sendChat",
   "cancelChat",
@@ -158,6 +161,8 @@ export interface PublicClientSummary {
   chatGpt: boolean;
   /** True when a non-expired refresh token proves OAuth completed. */
   authorized: boolean;
+  /** True when this persisted client belongs to a previous public origin. */
+  stale: boolean;
 }
 
 export interface DashboardState {
@@ -199,6 +204,8 @@ export interface DashboardState {
     active: boolean;
     /** Backwards-compatible aggregate: authorized or active. */
     connected: boolean;
+    /** Persisted ChatGPT clients deliberately rejected for another origin. */
+    staleConnections: number;
     activeSessions: number;
   };
   collaboration: {
