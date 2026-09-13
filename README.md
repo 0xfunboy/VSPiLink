@@ -242,6 +242,8 @@ Node runtime provisioned by the installer.
 
 ## License and acknowledgements
 
+Licensing scope and preserved third-party permissions are documented in [LICENSING.md](LICENSING.md). The [0xfunboy Non-Commercial License](LICENSE.md) covers eligible original material only.
+
 VSPiLink is distributed under the [MIT License](LICENSE). Preserve the license
 and copyright notice when redistributing substantial portions.
 
